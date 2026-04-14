@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <style>
+        * { margin: 0; padding: 0; overflow: hidden; pointer-events: none; }
+        body, html { 
+            width: 100%; height: 100%; 
+            background: transparent !important;
+        }
+        canvas { position: fixed; left: 0; top: 0; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <canvas id="sparkCanvas"></canvas>
+<script>
+/**
+ * 蔚蓝档案风格鼠标特效核心类
+ * 包含：平滑曲线拖尾、点击波纹(含中心闪光)、正三角形碎片(失重飘飞+膨胀)
+ */
+class MouseSpark {
+    constructor(opts = {}) {
+        // 核心配置
+        this.color = opts.color || '18,138,250';       // BA标志性青蓝色
+        this.scale = opts.scale || 1.5;
+        this.opacity = opts.opacity || 1.0;
+        this.speed = opts.speed || 1.0;
+        this.maxTrail = opts.maxTrail || 16;
+
+        // 对象池：复用DOM对象，减少垃圾回收导致的卡顿
+        this.sparkPool = [];
+        this.wavePool = [];
+
+        // 活跃对象数组
+        this.waves = [];
+        this.sparks = [];
+        this.trail = [];
+
+        // 状态记录
+        this.isDown = false;
+        this.lastPos = null;
+
+        // 帧率无关动画控制
+        this.baseFrameMs = 1000 / 60;
+        this.maxDeltaMs = 32; // 防止切后台回来时动画突变
+        this.lastFrameTime = performance.now();
+
+        this.initCanvas();
+        this.bindEvents();
+        requestAnimationFrame((now) => this.loop(now));
+    }
+
+    alpha(value) {
+        return Math.max(0, Math.min(1, value * this.opacity));
+    }
+
+    initCanvas() {
+        this.c = document.getElementById("sparkCanvas");
+        this.ctx = this.c.getContext("2d");
+        this.resize();
+        window.addEventListener("resize", () => this.resize());
+    }
+
+    resize() {
+        let dpr = window.devicePixelRatio || 1;
+        this.c.width = window.innerWidth * dpr;
+        this.c.height = window.innerHeight * dpr;
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    bindEvents() {
+        const getPos = (e) => ({ x: e.clientX, y: e.clientY });
+        const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+        window.addEventListener("mousedown", e => {
+            this.isDown = true;
+            this.lastPos = getPos(e);
+            this.boom(this.lastPos.x, this.lastPos.y);
+        });
+
+        window.addEventListener("mousemove", e => {
+            if (!this.isDown && !window.effectiveAlwaysTrail) return;
+            const p = getPos(e);
+            if (!this.lastPos) this.lastPos = p;
+
+            if (this.lastPos && dist(p, this.lastPos) > 2) {
+                // 记录拖尾点
+                this.trail.push({ x: p.x, y: p.y, life: 1 });
+                this.lastPos = p;
+                if (this.trail.length > this.maxTrail) this.trail.shift();
+
+                // 概率生成拖动碎片
+                if (Math.random() < 0.3) {
+                    let a = Math.random() * Math.PI * 2;
+                    let speedAdjust = this.scale / 1.5;
+                    let sparkColor = Math.random() > 0.5 ? '255,255,255' : this.color;
+
+                    // 碎片统一尺寸：从小膨胀到大
+                    let initS = (1.5 + Math.random() * 1.5) * this.scale;
+                    let targetS = (4.0 + Math.random() * 2.5) * this.scale;
+
+                    this.sparks.push({
+                        x: p.x + Math.cos(a) * 10 * this.scale,
+                        y: p.y + Math.sin(a) * 10 * this.scale,
+                        vx: Math.cos(a) * 1.3 * speedAdjust,
+                        vy: Math.sin(a) * 1.3 * speedAdjust,
+                        rot: Math.random() * Math.PI * 2,
+                        rs: 0.16,
+                        s: initS,
+                        targetS: targetS,
+                        a: 0.7,
+                        f: 0.95,
+                        c: sparkColor
+                    });
+                }
+            }
+        });
+
+        window.addEventListener("mouseup", () => this.isDown = false);
+    }
+
+    boom(x, y) {
+        let wave;
+        let waveType = Math.floor(Math.random() * 3);
+
+        // 波纹对象池复用
+        if (this.wavePool.length > 0) {
+            wave = this.wavePool.pop();
+            wave.x = x; wave.y = y; wave.life = 0;
+            wave.ang = Math.random() * Math.PI * 2;
+            wave.type = waveType;
+        } else {
+            wave = { x, y, life: 0, ang: Math.random() * Math.PI * 2, type: waveType };
+        }
+        this.waves.push(wave);
+
+        // 生成点击爆发碎片 (4个)
+        let particleCount = 4;
+        let speedAdjust = this.scale / 1.5;
+        for (let i = 0; i < particleCount; i++) {
+            let a = Math.random() * Math.PI * 2;
+            let speed = (4.8 + Math.random() * 2.5) * speedAdjust;
+            let sparkColor = Math.random() > 0.4 ? '255,255,255' : this.color;
+
+            let initS = (1.5 + Math.random() * 1.5) * this.scale;
+            let targetS = (4.0 + Math.random() * 2.5) * this.scale;
+
+            let spark;
+            // 碎片对象池复用
+            if (this.sparkPool.length > 0) {
+                spark = this.sparkPool.pop();
+                spark.x = x; spark.y = y;
+                spark.vx = Math.cos(a) * speed; spark.vy = Math.sin(a) * speed;
+                spark.rot = Math.random() * Math.PI * 2;
+                spark.rs = (Math.random() - 0.5) * 0.28;
+                spark.s = initS;
+                spark.targetS = targetS;
+                spark.a = 1; spark.f = 0.9;
+                spark.c = sparkColor;
+            } else {
+                spark = {
+                    x, y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed,
+                    rot: Math.random() * Math.PI * 2, rs: (Math.random() - 0.5) * 0.28,
+                    s: initS, targetS: targetS,
+                    a: 1, f: 0.9, c: sparkColor
+                };
+            }
+            this.sparks.push(spark);
+        }
+    }
+
+    loop(now) {
+        const deltaMs = Math.min(now - this.lastFrameTime, this.maxDeltaMs);
+        this.lastFrameTime = now;
+        // 帧率无关缩放系数
+        const frameScale = (deltaMs / this.baseFrameMs) * this.speed;
+
+        if (this.waves.length > 0 || this.sparks.length > 0 || this.trail.length > 0) {
+            this.ctx.clearRect(0, 0, this.c.width, this.c.height);
+
+            // 加色混合模式：实现BA特有的通透发光质感
+            this.ctx.globalCompositeOperation = "lighter";
+
+            // ================== 1. 渲染拖尾 ==================
+            for (let i = this.trail.length - 1; i >= 0; i--) {
+                let t = this.trail[i];
+                t.life -= (window.effectiveAlwaysTrail ? 0.085 : (this.isDown ? 0.085 : 0.18)) * frameScale;
+                if (t.life <= 0) this.trail.splice(i, 1);
+            }
+
+            if (this.trail.length > 1) {
+                this.ctx.beginPath();
+                this.ctx.moveTo(this.trail[0].x, this.trail[0].y);
+
+                // 二次贝塞尔曲线：消除线段折角，实现丝滑飘带
+                if (this.trail.length === 2) {
+                    this.ctx.lineTo(this.trail[1].x, this.trail[1].y);
+                } else {
+                    for (let i = 1; i < this.trail.length - 1; i++) {
+                        let xc = (this.trail[i].x + this.trail[i + 1].x) / 2;
+                        let yc = (this.trail[i].y + this.trail[i + 1].y) / 2;
+                        this.ctx.quadraticCurveTo(this.trail[i].x, this.trail[i].y, xc, yc);
+                    }
+                    let last = this.trail[this.trail.length - 1];
+                    let secondLast = this.trail[this.trail.length - 2];
+                    this.ctx.quadraticCurveTo(secondLast.x, secondLast.y, last.x, last.y);
+                }
+
+                this.ctx.lineWidth = 1.2 * this.scale;
+                const gradient = this.ctx.createLinearGradient(
+                    this.trail[this.trail.length - 1].x, this.trail[this.trail.length - 1].y,
+                    this.trail[0].x, this.trail[0].y
+                );
+                gradient.addColorStop(0, `rgba(${this.color}, 0.8)`);
+                gradient.addColorStop(1, `rgba(${this.color}, 0)`);
+
+                // 拖尾辉光
+                this.ctx.shadowColor = `rgba(${this.color}, 0.5)`;
+                this.ctx.shadowBlur = 6 * this.scale;
+
+                this.ctx.strokeStyle = gradient;
+                this.ctx.stroke();
+
+                this.ctx.shadowBlur = 0;
+                this.ctx.shadowColor = 'transparent';
+            }
+
+            // ================== 2. 渲染点击波纹 ==================
+            for (let i = this.waves.length - 1; i >= 0; i--) {
+                let w = this.waves[i];
+                w.life += frameScale;
+
+                let maxLife = 45;
+                let progress = w.life / maxLife;
+                if (progress >= 1) { this.wavePool.push(w); this.waves.splice(i, 1); continue; }
+
+                let easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+                let baseR = 26 * this.scale;
+                let rProg = Math.min(1, progress / 0.15);
+                let r = Math.max(0.1, baseR * easeOutCubic(rProg));
+                let thinLine = 0.8 * this.scale;
+
+                // 阶段A：中心高光爆发
+                if (progress < 0.15) {
+                    let flashAlpha = 1 - (progress / 0.15);
+                    let flashR = Math.max(0.1, 10 * this.scale * (progress / 0.15));
+                    let flashGrad = this.ctx.createRadialGradient(w.x, w.y, 0, w.x, w.y, flashR);
+                    flashGrad.addColorStop(0, `rgba(255,255,255,${this.alpha(flashAlpha)})`);
+                    flashGrad.addColorStop(1, `rgba(255,255,255,0)`);
+                    this.ctx.fillStyle = flashGrad;
+                    this.ctx.beginPath();
+                    this.ctx.arc(w.x, w.y, flashR, 0, Math.PI * 2);
+                    this.ctx.fill();
+                }
+
+                // 阶段B：蓝色径向渐变填充
+                let blueAlpha = 0;
+                if (progress <= 0.15) blueAlpha = progress / 0.15;
+                else if (progress <= 0.40) blueAlpha = 1;
+                else if (progress <= 0.55) blueAlpha = Math.max(0, 1 - (progress - 0.40) / 0.15);
+
+                if (blueAlpha > 0) {
+                    let glassGrad = this.ctx.createRadialGradient(w.x, w.y, 0, w.x, w.y, r);
+                    glassGrad.addColorStop(0, `rgba(${this.color},${this.alpha(blueAlpha * 0.1)})`);
+                    glassGrad.addColorStop(0.5, `rgba(${this.color},${this.alpha(blueAlpha * 0.35)})`);
+                    glassGrad.addColorStop(1, `rgba(${this.color},${this.alpha(blueAlpha * 0.6)})`);
+                    this.ctx.beginPath();
+                    this.ctx.arc(w.x, w.y, r, 0, Math.PI * 2);
+                    this.ctx.fillStyle = glassGrad;
+                    this.ctx.fill();
+                }
+
+                // 阶段C：内向辐射发光环
+                if (progress > 0.15 && progress < 0.35) {
+                    let glowProg = (progress - 0.15) / 0.20;
+                    let glowAlpha = glowProg < 0.2 ? (glowProg / 0.2) : (1 - (glowProg - 0.2) / 0.8);
+                    let glowWidth = 3.0 * this.scale * easeOutCubic(glowProg);
+
+                    if (glowAlpha > 0) {
+                        this.ctx.fillStyle = `rgba(255,255,255,${this.alpha(glowAlpha * 0.3)})`;
+                        this.ctx.beginPath();
+                        this.ctx.arc(w.x, w.y, r, 0, Math.PI * 2, false);
+                        this.ctx.arc(w.x, w.y, Math.max(0, r - glowWidth), Math.PI * 2, 0, true);
+                        this.ctx.fill();
+                    }
+                }
+
+                // 阶段D：白色弧线外沿 (展开 -> 停留 -> 收缩消失)
+                let lineAlpha = 1;
+                let start1 = w.ang, len1 = 0, start2 = 0, len2 = 0;
+
+                if (progress <= 0.10) {
+                    len1 = 0; len2 = 0;
+                } else if (progress <= 0.15) {
+                    let drawProg = (progress - 0.10) / 0.05;
+                    len1 = Math.PI * drawProg;
+                    start1 = w.ang - (Math.PI / 2) * drawProg;
+                    len2 = Math.PI * drawProg;
+                    start2 = w.ang + Math.PI - (Math.PI / 2) * drawProg;
+                } else if (progress <= 0.55) {
+                    len1 = Math.PI * 2;
+                    start1 = w.ang;
+                    len2 = 0;
+                } else {
+                    let shrinkProg = Math.min(1, (progress - 0.55) / 0.20);
+                    lineAlpha = 1 - shrinkProg;
+                    let fadeScale = Math.pow(1 - shrinkProg, 1.2);
+                    let gap = 0.4;
+
+                    // 随机弧线收缩形态
+                    if (w.type === 0) {
+                        start1 = w.ang; len1 = (Math.PI - gap) * fadeScale;
+                        start2 = w.ang + Math.PI; len2 = (Math.PI - gap) * fadeScale;
+                    } else if (w.type === 1) {
+                        start1 = w.ang + Math.PI * 0.4 * shrinkProg; len1 = (Math.PI * 1.3 - gap) * fadeScale;
+                        start2 = w.ang + Math.PI * 1.3 + gap + Math.PI * 0.3 * shrinkProg; len2 = (Math.PI * 0.7 - gap * 2) * fadeScale;
+                    } else {
+                        start1 = w.ang + Math.PI * 0.3 * shrinkProg; len1 = (Math.PI * 0.9 - gap) * fadeScale;
+                        start2 = w.ang + Math.PI * 0.9 + gap * 1.5 + Math.PI * 0.2 * shrinkProg; len2 = (Math.PI * 1.1 - gap * 2.5) * fadeScale;
+                    }
+                }
+
+                if (progress < 0.75 && lineAlpha > 0 && (len1 > 0 || len2 > 0)) {
+                    this.ctx.lineWidth = thinLine;
+                    this.ctx.strokeStyle = `rgba(255,255,255,${this.alpha(lineAlpha * 0.4)})`;
+                    this.ctx.lineCap = 'round';
+
+                    if (len1 > 0) { this.ctx.beginPath(); this.ctx.arc(w.x, w.y, r, start1, start1 + len1); this.ctx.stroke(); }
+                    if (len2 > 0) { this.ctx.beginPath(); this.ctx.arc(w.x, w.y, r, start2, start2 + len2); this.ctx.stroke(); }
+                }
+            }
+
+            // ================== 3. 渲染正三角形碎片 ==================
+            for (let i = this.sparks.length - 1; i >= 0; i--) {
+                let s = this.sparks[i];
+                s.x += s.vx * frameScale;
+                s.y += s.vy * frameScale;
+
+                // 阻力衰减 (无重力，失重飘飞)
+                s.vx *= Math.pow(s.f, frameScale);
+                s.vy *= Math.pow(s.f, frameScale);
+                s.rot += s.rs * frameScale;
+                s.a -= 0.032 * frameScale;
+
+                // 尺寸膨胀：从 initS 逐渐逼近 targetS
+                if (s.targetS && s.s < s.targetS) {
+                    s.s += (s.targetS - s.s) * 0.06 * frameScale;
+                }
+
+                if (s.a <= 0) {
+                    this.sparkPool.push(this.sparks[i]);
+                    this.sparks.splice(i, 1);
+                    continue;
+                }
+
+                this.ctx.save();
+                this.ctx.translate(s.x, s.y);
+                this.ctx.rotate(s.rot);
+
+                this.ctx.beginPath();
+                let currentSize = Math.max(0.1, s.s);
+                this.ctx.moveTo(0, -currentSize);
+                this.ctx.lineTo(currentSize * 0.866, currentSize * 0.5);
+                this.ctx.lineTo(-currentSize * 0.866, currentSize * 0.5);
+                this.ctx.closePath();
+
+                this.ctx.fillStyle = `rgba(${s.c},${this.alpha(s.a)})`;
+                this.ctx.fill();
+                this.ctx.restore();
+            }
+
+            // 恢复默认混合模式
+            this.ctx.globalCompositeOperation = "source-over";
+        }
+        requestAnimationFrame((nextNow) => this.loop(nextNow));
+    }
+}
+
+window.spark = new MouseSpark();
+
+// ==========================================
+// C# / PySide 通信接口 (供宿主程序绝对坐标调用)
+// ==========================================
+let lastBoomX = -1, lastBoomY = -1, lastBoomTime = 0;
+let lastMoveX = -1, lastMoveY = -1;
+
+window.currentInputMode = "mouse";
+window.enableAlwaysTrailEffect = false;
+window.effectiveAlwaysTrail = false;
+
+window.setInputContext = (mode, alwaysTrailEnabled) => {
+    window.currentInputMode = mode === "touch" ? "touch" : "mouse";
+    window.enableAlwaysTrailEffect = Boolean(alwaysTrailEnabled);
+    // 仅在鼠标模式下且开启常驻拖尾时生效
+    window.effectiveAlwaysTrail = window.currentInputMode === "mouse" && window.enableAlwaysTrailEffect;
+};
+window.setInputContext("mouse", false);
+
+// 外部点击事件 (防抖25ms)
+window.externalBoom = (x, y) => {
+    const now = Date.now();
+    if (x === lastBoomX && y === lastBoomY && (now - lastBoomTime) < 25) return;
+    lastBoomX = x; lastBoomY = y; lastBoomTime = now;
+    window.dispatchEvent(new MouseEvent('mousedown', { clientX: x, clientY: y, bubbles: true }));
+};
+
+// 外部移动事件
+window.externalMove = (x, y) => {
+    if (x === lastMoveX && y === lastMoveY) return;
+    lastMoveX = x; lastMoveY = y;
+    window.dispatchEvent(new MouseEvent('mousemove', { clientX: x, clientY: y, bubbles: true }));
+};
+
+// 外部抬起事件
+window.externalUp = () => {
+    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+};
+
+// 动态更新颜色
+window.updateColor = (rgbString) => {
+    if (window.spark) window.spark.color = rgbString;
+};
+
+// 动态更新缩放/透明度/速度
+window.updateEffectSettings = (scale, opacity, speed) => {
+    if (!window.spark) return;
+    window.spark.scale = Math.max(0.5, Math.min(3, Number(scale) || 1.5));
+    window.spark.opacity = Math.max(0.1, Math.min(1, Number(opacity) || 1.0));
+    window.spark.speed = Math.max(0.2, Math.min(3, Number(speed) || 1.0));
+};
+</script>
+</body>
+</html>

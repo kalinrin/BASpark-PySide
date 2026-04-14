@@ -1,0 +1,130 @@
+name: Build BASpark-PySide
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: BASpark-windows-64
+            mac_arch: x86_64
+          - os: macos-15-intel
+            artifact_name: BASpark-macos-64
+            mac_arch: x86_64
+          - os: macos-latest
+            artifact_name: BASpark-macos-arm64
+            mac_arch: arm64
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install nuitka zstandard imageio
+
+      - name: Fix OpenSSL (macOS Intel)
+        if: matrix.os == 'macos-15-intel'
+        run: brew unlink openssl@3 || true
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        run: >
+          python -m nuitka --onefile
+          --windows-console-mode=disable
+          --assume-yes-for-downloads
+          --output-dir=dist
+          --output-filename=BASpark
+          --enable-plugin=pyside6
+          --enable-plugin=anti-bloat
+          --noinclude-qt-translations
+          --include-data-dir=web=web
+          --include-data-files=app.ico=app.ico
+          --windows-icon-from-ico=app.ico
+          --python-flag=no_asserts
+          --python-flag=no_docstrings
+          --lto=yes
+          --nofollow-import-to=PySide6.Qt3DCore
+          --nofollow-import-to=PySide6.Qt3DRender
+          --nofollow-import-to=PySide6.QtQml
+          --nofollow-import-to=PySide6.QtQuick
+          --nofollow-import-to=PySide6.QtSql
+          --nofollow-import-to=PySide6.QtSensors
+          --nofollow-import-to=PySide6.QtBluetooth
+          --nofollow-import-to=PySide6.QtNfc
+          --nofollow-import-to=PySide6.QtMultimedia
+          --nofollow-import-to=PySide6.QtMultimediaWidgets
+          --nofollow-import-to=PySide6.QtPositioning
+          --nofollow-import-to=PySide6.QtTest
+          --nofollow-import-to=PySide6.QtXml
+          main.py
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/main.exe") { Rename-Item "dist/main.exe" "BASpark.exe" }
+          if (Test-Path "dist/BASpark.exe") { Move-Item "dist/BASpark.exe" "./BASpark.exe" }
+          Compress-Archive -Path BASpark.exe -DestinationPath ${{ matrix.artifact_name }}.zip
+
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        run: >
+          python -m nuitka --standalone
+          --macos-create-app-bundle
+          --macos-app-name=BASpark
+          --macos-app-mode=gui
+          --macos-target-arch=${{ matrix.mac_arch }}
+          --assume-yes-for-downloads
+          --output-dir=dist
+          --enable-plugin=pyside6
+          --enable-plugin=anti-bloat
+          --noinclude-qt-translations
+          --include-data-dir=web=web
+          --include-data-files=app.ico=app.ico
+          --macos-app-icon=app.ico
+          --python-flag=no_asserts
+          --python-flag=no_docstrings
+          --lto=yes
+          --nofollow-import-to=PySide6.Qt3DCore
+          --nofollow-import-to=PySide6.Qt3DRender
+          --nofollow-import-to=PySide6.QtQml
+          --nofollow-import-to=PySide6.QtQuick
+          --nofollow-import-to=PySide6.QtSql
+          --nofollow-import-to=PySide6.QtSensors
+          --nofollow-import-to=PySide6.QtBluetooth
+          --nofollow-import-to=PySide6.QtNfc
+          --nofollow-import-to=PySide6.QtMultimedia
+          --nofollow-import-to=PySide6.QtMultimediaWidgets
+          --nofollow-import-to=PySide6.QtPositioning
+          --nofollow-import-to=PySide6.QtTest
+          --nofollow-import-to=PySide6.QtXml
+          main.py
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          if [ -d "main.app" ]; then mv main.app BASpark.app; fi
+          zip -ry ../${{ matrix.artifact_name }}.zip BASpark.app
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: "*.zip"
