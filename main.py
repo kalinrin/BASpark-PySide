@@ -17,7 +17,9 @@ def main():
     sys.argv.extend([
         "--disable-background-timer-throttling",
         "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-ipc-flooding-protection"
+        "--disable-ipc-flooding-protection",
+        "--log-level=3",
+        "--disable-logging"
     ])
 
     if sys.platform == 'darwin':
