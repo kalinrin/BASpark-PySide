@@ -10,22 +10,28 @@ from utils.helpers import get_resource_path, check_single_instance
 from core.window import BASparkWindow
 
 def main():
+    # 关闭 Qt 内部框架的警告与调试日志输出
+    os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.*.debug=false;*.warning=false"
+
     # 启用高 DPI 缩放支持
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
     # Chromium 渲染引擎性能与兼容性参数优化
-    sys.argv.extend([
+    chromium_flags = [
         "--disable-background-timer-throttling",
         "--disable-features=CalculateNativeWinOcclusion",
         "--disable-ipc-flooding-protection",
         "--log-level=3",
         "--disable-logging"
-    ])
+    ]
 
     if sys.platform == 'darwin':
         sys.argv.extend(["--disable-renderer-backgrounding", "--disable-mac-overlays"])
     else:
         sys.argv.extend(["--disable-gpu-compositing", "--ignore-gpu-blocklist"])
+
+    # 将参数传入 QtWebEngine 底层
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(chromium_flags)
 
     app = QApplication(sys.argv)
 
