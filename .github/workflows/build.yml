@@ -74,13 +74,12 @@ jobs:
           --nofollow-import-to=PySide6.QtXml
           main.py
 
-      - name: Package Windows
+      - name: Prepare Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           if (Test-Path "dist/main.exe") { Rename-Item "dist/main.exe" "BASpark.exe" }
           if (Test-Path "dist/BASpark.exe") { Move-Item "dist/BASpark.exe" "./BASpark.exe" }
-          Compress-Archive -Path BASpark.exe -DestinationPath ${{ matrix.artifact_name }}.zip
 
       - name: Build macOS
         if: runner.os == 'macOS'
@@ -123,7 +122,15 @@ jobs:
           if [ -d "main.app" ]; then mv main.app BASpark.app; fi
           zip -ry ../${{ matrix.artifact_name }}.zip BASpark.app
 
-      - name: Upload Artifacts
+      - name: Upload Windows Artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: "BASpark.exe"
+
+      - name: Upload macOS Artifact
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
