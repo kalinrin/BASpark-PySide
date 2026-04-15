@@ -47,6 +47,7 @@ jobs:
         run: >
           python -m nuitka --onefile
           --windows-console-mode=disable
+          --windows-uac-admin
           --assume-yes-for-downloads
           --output-dir=dist
           --output-filename=BASpark
