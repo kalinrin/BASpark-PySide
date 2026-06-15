@@ -36,12 +36,12 @@ class AppTray(QSystemTrayIcon):
         self.action_arona = QAction("阿洛娜 (默认蓝)", self.window)
         self.action_arona.setCheckable(True)
         self.action_arona.setChecked(True)
-        self.action_arona.triggered.connect(lambda: self.window.change_theme_color('13,184,255'))
+        self.action_arona.triggered.connect(lambda: self.window.change_theme_color('76,167,255'))
 
         self.action_plana = QAction("普拉娜 (普拉娜粉)", self.window)
         self.action_plana.setCheckable(True)
         self.action_plana.setChecked(False)
-        self.action_plana.triggered.connect(lambda: self.window.change_theme_color('255,138,216'))
+        self.action_plana.triggered.connect(lambda: self.window.change_theme_color('255,76,166'))
 
         # 配色项互斥，保证同时只有一个被选中
         self.color_group = QActionGroup(self.window)
