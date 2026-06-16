@@ -30,6 +30,12 @@ class AppTray(QSystemTrayIcon):
 
         tray_menu = QMenu()
 
+        # --- 设置 ---
+        settings_action = QAction("设置", self.window)
+        settings_action.triggered.connect(self.window.show_settings_window)
+        tray_menu.addAction(settings_action)
+        tray_menu.addSeparator()
+
         # --- 特效配色子菜单 ---
         color_menu = QMenu("特效配色", self.window)
 

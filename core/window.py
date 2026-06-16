@@ -24,6 +24,7 @@ class BASparkWindow(QMainWindow):
 
         # 上一次发送给前端的坐标，用于去重
         self._last_sent_pos = (-1, -1)
+        self.settings_window = None
 
         self._init_window_attributes()
         self._init_browser()
@@ -136,7 +137,7 @@ class BASparkWindow(QMainWindow):
         """通知前端切换特效配色。
 
         Args:
-            rgb_str (str): 形如 "13,184,255" 的 RGB 字符串。
+            rgb_str (str): 形如 "76,167,255" 的 RGB 字符串。
         """
         self.browser.page().runJavaScript(f"if(window.updateColor)window.updateColor('{rgb_str}');")
 
@@ -175,6 +176,28 @@ class BASparkWindow(QMainWindow):
     def _trigger_up(self):
         """左键释放：通知前端结束当前交互。"""
         self.browser.page().runJavaScript("if(window.externalUp)window.externalUp();")
+
+    def show_settings_window(self):
+        """打开设置面板，确保单例并显示在最前面，且默认打开‘关于’页面。"""
+        from core.settings_window import SettingsWindow
+        
+        # 检查 settings_window 是否由于被关闭而销毁
+        if self.settings_window is not None:
+            try:
+                # 若窗口已被 C++ 销毁，调用任何方法都会抛出 RuntimeError
+                self.settings_window.parent()
+            except RuntimeError:
+                self.settings_window = None
+
+        if self.settings_window is None:
+            self.settings_window = SettingsWindow(self)
+
+        # 每次打开都重新读取系统实际状态，避免显示未应用的旧开关状态
+        self.settings_window._load_settings()
+        self.settings_window.show_about_page()
+        self.settings_window.show()
+        self.settings_window.raise_()
+        self.settings_window.activateWindow()
 
     def closeEvent(self, event):
         """窗口关闭时停止鼠标监听，释放资源。"""
