@@ -7,7 +7,7 @@ from PySide6.QtNetwork import QLocalSocket, QLocalServer
 
 
 def get_resource_path(relative_path: str) -> Path:
-    """获取资源文件的绝对路径，兼容开发环境与 PyInstaller 打包。
+    """获取资源文件的绝对路径，兼容开发环境与打包环境（Nuitka / PyInstaller）。
 
     Args:
         relative_path (str): 相对于项目根目录的路径。
@@ -15,8 +15,13 @@ def get_resource_path(relative_path: str) -> Path:
     Returns:
         Path: 资源文件的绝对路径。
     """
-    # 打包后从 _MEIPASS 临时目录取资源，否则取项目根目录
-    base_path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent))
+    if "__compiled__" in globals() or getattr(sys, "frozen", False):
+        # 打包后：Nuitka standalone/onefile 将资源解包到可执行文件同级目录；
+        # PyInstaller 则放在 sys._MEIPASS，优先取后者
+        base_path = Path(getattr(sys, "_MEIPASS", Path(sys.argv[0]).resolve().parent))
+    else:
+        # 开发环境：项目根目录（本文件的上两级）
+        base_path = Path(__file__).resolve().parent.parent
     return base_path / relative_path
 
 

@@ -8,6 +8,7 @@
 import sys
 import os
 import plistlib
+import tempfile
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -21,22 +22,46 @@ from PySide6.QtGui import QIcon, QPainter, QColor, QBrush, QPainterPath
 from utils.helpers import get_resource_path
 
 
+def _is_compiled() -> bool:
+    """是否为编译/打包后的程序。
+
+    Nuitka 会向每个模块注入全局变量 __compiled__；同时兼容 PyInstaller 的 sys.frozen。
+    """
+    return "__compiled__" in globals() or getattr(sys, "frozen", False)
+
+
+def _executable_path() -> str:
+    """打包程序对应的真实可执行文件绝对路径。
+
+    Nuitka onefile 会在运行时把"用户启动的原始 exe"注入到进程环境变量
+    NUITKA_ONEFILE_BINARY（仅存在于运行中的进程内部，外部终端 echo 查不到，属正常）。
+    它指向用户双击的原始 exe，而非每次运行都变化的临时解包目录，因此优先采用；
+    取不到时回退 sys.argv[0]。不使用 sys.executable —— Nuitka onefile 下它指向
+    临时目录中的内部副本。
+    """
+    exe = os.path.realpath(os.environ.get("NUITKA_ONEFILE_BINARY") or sys.argv[0])
+    # 防呆：若路径落在临时解包目录内，说明拿到的是会被自动删除的临时副本，
+    # 写入自启动将失效。此时宁可显式报错，也不要静默写入无效路径。
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    if "onefile_" in exe or exe.lower().startswith(temp_root.lower()):
+        raise RuntimeError(f"无法确定原始可执行文件路径，疑似临时目录：{exe}")
+    return exe
+
+
 def get_autostart_cmd() -> list[str]:
     """获取自启动所需的命令行参数列表，兼容开发模式与打包模式。"""
-    if getattr(sys, 'frozen', False):
-        # 打包模式：直接启动可执行程序
-        exe_path = sys.executable
-        # macOS 下若可执行文件位于 .app 包内，改用 `open` 启动整个 bundle，
-        # 确保应用获得正确的 Info.plist 上下文（激活策略 / Dock 行为）
-        if sys.platform == "darwin":
-            for parent in Path(exe_path).parents:
-                if parent.suffix == ".app":
-                    return ["open", str(parent), "--args", "--autostart"]
-        return [exe_path, "--autostart"]
-    else:
+    if not _is_compiled():
         # 开发模式：用 python 解释器启动入口脚本
-        main_py = os.path.abspath(sys.argv[0])
-        return [sys.executable, main_py, "--autostart"]
+        return [sys.executable, os.path.abspath(sys.argv[0]), "--autostart"]
+
+    exe_path = _executable_path()
+    # macOS 下若可执行文件位于 .app 包内，改用 `open` 启动整个 bundle，
+    # 确保应用获得正确的 Info.plist 上下文（激活策略 / Dock 行为）
+    if sys.platform == "darwin":
+        for parent in Path(exe_path).parents:
+            if parent.suffix == ".app":
+                return ["/usr/bin/open", str(parent), "--args", "--autostart"]
+    return [exe_path, "--autostart"]
 
 
 def set_autostart(enabled: bool) -> bool:
@@ -53,14 +78,11 @@ def set_autostart(enabled: bool) -> bool:
             import ctypes
             import winreg
 
-            cmd = get_autostart_cmd()
-            if getattr(sys, 'frozen', False):
-                exe_path = cmd[0]
-                task_tr = f'"{exe_path}" --autostart'
-            else:
-                python_path = cmd[0]
-                script_path = cmd[1]
-                task_tr = f'"{python_path}" "{script_path}" --autostart'
+            # 命令行统一由 get_autostart_cmd 生成，再用 list2cmdline 按 Windows 官方
+            # 引号规则拼接为字符串，含空格路径也能正确处理；
+            # 注册表 REG_SZ 与任务计划 /tr 共用同一份命令
+            cmd_args = get_autostart_cmd()
+            task_tr = subprocess.list2cmdline(cmd_args)
 
             task_name = "BASparkAutoStart"
             reg_key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
