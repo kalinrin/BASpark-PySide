@@ -15,12 +15,16 @@ def get_resource_path(relative_path: str) -> Path:
     Returns:
         Path: 资源文件的绝对路径。
     """
-    if "__compiled__" in globals() or getattr(sys, "frozen", False):
-        # 打包后：Nuitka standalone/onefile 将资源解包到可执行文件同级目录；
-        # PyInstaller 则放在 sys._MEIPASS，优先取后者
-        base_path = Path(getattr(sys, "_MEIPASS", Path(sys.argv[0]).resolve().parent))
+    if hasattr(sys, "_MEIPASS"):
+        # PyInstaller onefile：资源解包到 sys._MEIPASS
+        base_path = Path(sys._MEIPASS)
     else:
-        # 开发环境：项目根目录（本文件的上两级）
+        # Nuitka（standalone/onefile）与开发环境统一处理：
+        # __file__ 始终指向模块在程序内的真实位置——onefile 下为临时解包目录、
+        # standalone 下为分发目录，其上两级即项目根，web/ 与 app.ico 均在此。
+        # 切勿改用 sys.argv[0]：onefile 模式下它指向原始 exe 所在目录
+        # （如 D:\Program Files\BASpark\），而数据文件实际解包到临时目录，
+        # 会导致 Windows 下图标与 web 资源全部加载失败。
         base_path = Path(__file__).resolve().parent.parent
     return base_path / relative_path
 
