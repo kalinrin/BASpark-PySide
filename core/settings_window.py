@@ -411,7 +411,7 @@ class SettingsWindow(QMainWindow):
         footer_layout.setSpacing(2)
         footer_layout.setContentsMargins(0, 0, 0, 10)
 
-        lbl_ver = QLabel("BASpark V1.2.0")
+        lbl_ver = QLabel("BASpark V1.2.1")
         lbl_ver.setAlignment(Qt.AlignCenter)
         lbl_ver.setStyleSheet("color: #B0B8C3; font-size: 10px;")
 
@@ -553,7 +553,7 @@ class SettingsWindow(QMainWindow):
 
         # 版本号文字
         lbl_about_ver = QLabel()
-        lbl_about_ver.setText('<span style="font-size: 28px; font-weight: bold; color: #111111;">BASpark </span><span style="font-size: 24px; font-weight: bold; color: #4CA7FF;">V1.2.0</span>')
+        lbl_about_ver.setText('<span style="font-size: 28px; font-weight: bold; color: #111111;">BASpark </span><span style="font-size: 24px; font-weight: bold; color: #4CA7FF;">V1.2.1</span>')
         lbl_about_ver.setStyleSheet("background: transparent; margin-bottom: 14px;")
         page_about_layout.addWidget(lbl_about_ver)
 

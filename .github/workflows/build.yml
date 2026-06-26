@@ -16,10 +16,10 @@ jobs:
           - os: windows-latest
             artifact_name: BASpark-windows-64
             mac_arch: x86_64
-          - os: macos-15-intel
+          - os: macos-26-intel
             artifact_name: BASpark-macos-64
             mac_arch: x86_64
-          - os: macos-latest
+          - os: macos-26
             artifact_name: BASpark-macos-arm64
             mac_arch: arm64
 
@@ -39,7 +39,7 @@ jobs:
           pip install nuitka zstandard imageio
 
       - name: Fix OpenSSL (macOS Intel)
-        if: matrix.os == 'macos-15-intel'
+        if: matrix.os == 'macos-26-intel'
         run: brew unlink openssl@3 || true
 
       - name: Build Windows
