@@ -52,7 +52,6 @@ jobs:
           --output-dir=dist
           --output-filename=BASpark
           --enable-plugin=pyside6
-          --enable-plugin=anti-bloat
           --noinclude-qt-translations
           --include-data-dir=web=web
           --include-data-files=app.ico=app.ico
@@ -93,11 +92,10 @@ jobs:
           --assume-yes-for-downloads
           --output-dir=dist
           --enable-plugin=pyside6
-          --enable-plugin=anti-bloat
           --noinclude-qt-translations
           --include-data-dir=web=web
           --include-data-files=app.ico=app.ico
-          --macos-app-icon=app.ico
+          --macos-app-icon=app.icns
           --python-flag=no_asserts
           --python-flag=no_docstrings
           --lto=yes
