@@ -19,9 +19,11 @@ jobs:
           - os: macos-26-intel
             artifact_name: BASpark-macos-64
             mac_arch: x86_64
+            deployment_target: "15.0"
           - os: macos-26
             artifact_name: BASpark-macos-arm64
             mac_arch: arm64
+            deployment_target: "15.0"
 
     steps:
       - name: Checkout Code
@@ -38,7 +40,7 @@ jobs:
           pip install -r requirements.txt
           pip install nuitka zstandard imageio
 
-      - name: Fix OpenSSL (macOS Intel)
+      - name: Unlink Homebrew OpenSSL to avoid bundling host paths (macOS Intel)
         if: matrix.os == 'macos-26-intel'
         run: brew unlink openssl@3 || true
 
@@ -83,6 +85,8 @@ jobs:
 
       - name: Build macOS
         if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: >
           python -m nuitka --standalone
           --macos-create-app-bundle
@@ -113,6 +117,20 @@ jobs:
           --nofollow-import-to=PySide6.QtTest
           --nofollow-import-to=PySide6.QtXml
           main.py
+
+      - name: Verify minimum macOS version
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          if [ -d "main.app" ]; then
+            APP_DIR="main.app/Contents"
+            echo "==== Highest minos across all bundled binaries ===="
+            find "$APP_DIR" -type f \( -name "*.dylib" -o -name "*.so" -o -name "Python" \) -print0 | \
+            while IFS= read -r -d '' f; do
+              v=$(otool -l "$f" 2>/dev/null | awk '/LC_VERSION_MIN_MACOSX/{f=1} /LC_BUILD_VERSION/{f=1} f&&/minos|version/{print $2; f=0}')
+              echo "$v  $f"
+            done | sort -rn | head -20
+          fi
 
       - name: Package macOS
         if: runner.os == 'macOS'
