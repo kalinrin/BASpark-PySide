@@ -25,7 +25,10 @@ jobs:
           - os: macos-26
             artifact_name: BASpark-macos-arm64
             mac_arch: arm64
-            # 自建 Python 本体是按 11.0 编的，这里想放宽支持范围可以下调
+            # 不要下调：PySide6 6.11 的绑定层（libpyside6 / libshiboken6 / PySide6/*.so）
+            # 本身就是 minos 15.0（Qt 插件才是 13.0），下限由 wheel 决定，调低只会
+            # 产生链接警告 + 让 Info.plist 的 LSMinimumSystemVersion 谎报版本。
+            # 真要降低门槛，唯一的办法是钉一个更老的 PySide6 版本。
             deployment_target: "15.0"
             py_platform: macos-arm64
 
