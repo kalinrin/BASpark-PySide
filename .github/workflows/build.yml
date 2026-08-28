@@ -110,9 +110,10 @@ jobs:
       # 优先加载，于是新 msvcp 配旧 vcruntime，用户机上可能直接
       #   "无法定位程序输入点 XXX 于动态链接库 VCRUNTIME140.dll"
       # 而构建机 System32 里有新版，这个故障永远复现不出来。
-      # 这里用 Nuitka 会选中的同一份 redist 覆盖 Python 根目录里的 vcruntime140*.dll，
-      # 让产物里的整套 CRT 同源同版本（新 vcruntime 向后兼容旧 msvcp，方向是安全的，
-      # 也顺带盖住 PySide6 自带的 shiboken6\msvcp140.dll 那份老的）。
+      # 这里用 Nuitka 会选中的同一份 redist 覆盖 Python 根目录里的 vcruntime140*.dll。
+      # 方向必须是"升 vcruntime"而不是"降 msvcp"：新 vcruntime 兼容旧 msvcp，反之不行。
+      # 注意这步只管 Python 根目录 —— 此刻 PySide6 还没装，site-packages\shiboken6 下那
+      # 4 份 v143 时代的 msvcp140* 还不存在，它们由 "Unify CRT across the tree" 那步收口。
       - name: Align VC runtime with MSVC redist (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -138,6 +139,9 @@ jobs:
                  Select-Object -First 1
           if (-not $crt) { throw "找不到 $($verDir.FullName)\x64\Microsoft.VC*.CRT" }
           Write-Host "CRT redist : $($crt.FullName)"
+          # 交给后面的 "Unify CRT across the tree"：两步必须用同一份 redist，
+          # 各自跑一遍 vswhere 就有再次错配的可能
+          "MSVC_CRT_REDIST=$($crt.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           $root = $env:PYTHON_ROOT
           $copied = 0
@@ -241,6 +245,59 @@ jobs:
           python -m pip list
           python -m nuitka --version
 
+      # ★ 依赖装完后再收一次口，并且把"对齐成功"变成日志里可验证的事实 ★
+      # 上一版 report 实测：shiboken6\msvcp140{,_1,_2,_codecvt_ids}.dll 四份的来源都是
+      # ${sys.prefix}\Lib\site-packages\shiboken6\（PySide6 wheel 自带，v143 时代），
+      # 而根目录那几份 msvcp140* 是 Nuitka 从 VS2026 的 14.51 redist 复制的。
+      # CPython 在 Windows 上用 LOAD_WITH_ALTERED_SEARCH_PATH 加载扩展模块，扩展所在目录
+      # 优先：于是 shiboken6\Shiboken.pyd 绑同目录那份旧 msvcp140，而根目录的
+      # shiboken6.abi3.dll 绑新的 —— 同一个进程里两个 C++ 运行时实例、两套 locale/iostream
+      # 状态，而这两个模块之间恰恰在大量传 C++ 对象。
+      # 另一个必须做这步的理由：report 里记的永远是"替换前的源路径"，同一个路径原地换内容
+      # 在 report 里完全看不出来，所以 CRT 对齐这件事只能靠这里的日志 + 断言来验收。
+      # 只替换树里已存在的同名文件（不新增 DLL），最后硬断言"全树只剩一个版本号"。
+      - name: Unify CRT across the tree (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $crt  = $env:MSVC_CRT_REDIST
+          $root = $env:PYTHON_ROOT
+          if (-not $crt -or -not (Test-Path $crt)) { throw "MSVC_CRT_REDIST 无效: $crt" }
+          Write-Host "CRT redist : $crt"
+          Write-Host "Python root: $root"
+
+          $targets = @(Get-ChildItem $root -Recurse -File -Include 'msvcp140*.dll','vcruntime140*.dll')
+          if ($targets.Count -eq 0) { throw "树里一个 CRT DLL 都没有，PYTHON_ROOT 不对？" }
+
+          $unmatched = @()
+          foreach ($t in $targets) {
+            $src = Join-Path $crt $t.Name
+            if (Test-Path $src) {
+              $old = (Get-Item $t.FullName).VersionInfo.FileVersion
+              Copy-Item $src $t.FullName -Force
+              Write-Host ("  {0,-26} {1,-18} -> {2,-18} {3}" -f $t.Name, $old,
+                          (Get-Item $t.FullName).VersionInfo.FileVersion,
+                          $t.DirectoryName.Replace($root, '<root>'))
+            } else {
+              $unmatched += $t.FullName
+            }
+          }
+          foreach ($u in $unmatched) { Write-Host "::warning::redist 里没有同名文件，未对齐: $u" }
+
+          # 全树只允许一个 CRT 版本号：混版在构建机上永远正常（System32 有新版兜着），
+          # 到用户机上才炸成"无法定位程序输入点 ... 于 VCRUNTIME140.dll"
+          $vers = @(Get-ChildItem $root -Recurse -File -Include 'msvcp140*.dll','vcruntime140*.dll' |
+                    ForEach-Object { (Get-Item $_.FullName).VersionInfo.FileVersion } |
+                    Sort-Object -Unique)
+          Write-Host "CRT versions in tree: $($vers -join ' | ')"
+          if ($vers.Count -ne 1) { throw "树里存在多个 CRT 版本: $($vers -join ' | ')" }
+
+          # 换完必须能真正加载：这一行会把根目录的 shiboken6.abi3.dll 与
+          # shiboken6\Shiboken.pyd 连同两处 msvcp140 一起拉起来，是对上面替换最直接的验证
+          python -c "from PySide6 import QtCore; print('PySide6 OK', QtCore.qVersion())"
+          if ($LASTEXITCODE -ne 0) { throw "统一 CRT 后 PySide6 加载失败" }
+
       # C 编译产物缓存：代码变了 key 就变，但 restore-keys 前缀能复用大部分对象文件。
       # Windows+MSVC 走内置 clcache，macOS 走下一步安装的 ccache，都落在 NUITKA_CACHE_DIR。
       - name: Cache Nuitka C objects
@@ -258,19 +315,27 @@ jobs:
       # --msvc=latest：windows-2025 镜像上 VS2022 与 VS2026 并存，latest 实际选中的是
       # VS2026(v145 / 14.51) —— 证据是上一版 report 里 msvcp140.dll 的来源路径
       # "...\Visual Studio\18\enterprise\VC\Redist\MSVC\14.51.36231\x64\microsoft.vc145.crt\"。
-      # 不钉 --msvc=14.3（v145 与 v143 的 CRT 官方向前兼容），而是用上面的
-      # "Align VC runtime" 步骤把 CRT 来源统一到同一份 redist。
+      # 不钉 --msvc=14.3（v145 与 v143 的 CRT 官方向前兼容），而是用 "Align VC runtime"
+      # + "Unify CRT across the tree" 两步把 CRT 来源统一到同一份 redist 并断言只剩一个版本。
       #
-      # --noinclude-data-files 那三行的依据（上一版 report 实测）：
-      #   qtwebengine_devtools_resources.debug.pak   75.8 MB
-      #   qtwebengine_resources.debug.pak             2.3 MB
-      #   qtwebengine_resources_{100,200}p.debug.pak  0.3 MB
-      #   qtwebengine_devtools_resources.pak         11.6 MB  ← 非 debug 的 DevTools 前端
-      # 全是只有打开远程调试面板才会读的东西。onefile 体积（上一版 109 MB）掉得有限，
-      # 但缓存解包目录直接少 ~86 MB，首启解包时间同比例缩短。
-      # --noinclude-dlls=*qpdf*：imageformats 的 qpdf 插件是 qt6pdf.dll 的唯一引用者
-      # （report: reason="Used by 'PySide6\qt-plugins\imageformats\qpdf.dll'"），我们不需要
-      # 把 PDF 当图片加载。加完务必看新 report 里这些条目是否真的消失了。
+      # --noinclude-data-files 两行：已由 1.2.1 那版 report 验收 ✔
+      #   删之前（实测大小）：qtwebengine_devtools_resources.debug.pak 75.8 MB /
+      #   qtwebengine_resources.debug.pak 2.3 MB / *_{100,200}p.debug.pak 0.3 MB /
+      #   qtwebengine_devtools_resources.pak 11.6 MB —— 全是只有打开远程调试面板才读的东西。
+      #   删之后：data_file 只剩 icudtl.dat 10,467,680 / qtwebengine_resources.pak 2,268,263 /
+      #   _100p 151,066 / _200p 195,754 / v8_context_snapshot.bin 693,957；搜 debug.pak 与
+      #   devtools 都是 0 条。onefile_binary 114,701,824 -> 94,532,096（-19.2 MiB / -17.6%），
+      #   缓存解包目录少 ~86 MB。
+      #   （曾担心"过滤器匹配的是目标路径，而这些 pak 是 pyside6 插件以 Qt resources 身份
+      #   加进来的，未必拦得住" —— 实测拦得住，不需要改用 package-config yaml。）
+      # --noinclude-dlls=*qpdf*：qpdf.dll 已 ignored="yes" ✔，但它拖进来的 qt6pdf.dll 还在，
+      #   reason 依旧是 "Used by 'PySide6\qt-plugins\imageformats\qpdf.dll'" —— Nuitka 是先记
+      #   依赖边、后判 ignore，孤儿不回收。想再省 ~10 MB 可加 --noinclude-dlls="qt6pdf.dll"，
+      #   但残余风险要认：report 每个 DLL 只记一个 reason，证明不了 QtPrintSupport 之类没有
+      #   第二个引用者，猜错就是用户机上"启动即缺 DLL"。本轮故意不加。
+      # --noinclude-qt-translations：Windows 侧把 Chromium 的 qtwebengine_locales 也一起带走了
+      #   （新 report 里 0 条 locale pak；mac 侧一份不少，见下面 macOS 段的对照）。纯本地
+      #   HTML 能跑；若出现右键菜单/错误页乱码或空白，第一嫌疑就是这条。
       #
       # --onefile-cache-mode=cached + {CACHE_DIR}/BASpark/{VERSION}：
       # 默认 onefile 每次启动都要把 ~300MB（Qt6WebEngineCore + *.pak + icudtl.dat）解到
@@ -299,8 +364,8 @@ jobs:
           --product-name=BASpark
           --product-version=${{ env.APP_VERSION }}
           --file-version=${{ env.APP_VERSION }}
-          --file-description="BASpark Desktop Overlay"
-          --copyright="Copyright (c) 2025 BASpark"
+          --file-description="BASpark"
+          --copyright="Copyright © 2026 kalinrin"
           --onefile-cache-mode=cached
           --onefile-tempdir-spec="{CACHE_DIR}/BASpark/{VERSION}"
           --python-flag=no_asserts
@@ -333,6 +398,22 @@ jobs:
       # 现在靠"包里没有 .a"隐式走动态链接，这里显式钉死，防止哪天上游又装回 .a。
       # --macos-signed-app-name 定下来就别再改：pynput 的全局鼠标监听要"输入监控/辅助功能"
       # 授权，LaunchAgent 自启也认这个 bundle id，改一次用户就得重新授权一次。
+      #
+      # mac 侧那两条 --noinclude-data-files 同样验收通过 ✔（新 report 里 debug.pak 与
+      # devtools 均 0 条），而且在 mac 上比 Windows 值钱 3 倍：Nuitka 会把 framework 里的
+      # Resources 符号链接解引用，同一批资源在 bundle 里落 3 份 —— report 实测
+      #   ① 顶层（reason="Qt WebEngine resources"）
+      #   ② PySide6/Qt/lib/QtWebEngineCore.framework/Resources/
+      #   ③ 同上 /Versions/A/Resources/
+      # 三份里 icudtl.dat 各 10,467,680、qtwebengine_locales 各 53 个 pak 共 45.5 MB，
+      # 单是这批资源就 3 x 59.9 MB = 171 MiB（其中 114 MiB 是纯重复）。按同样的 3 份计，
+      # 上面删掉的 devtools/debug pak 在 mac 上省的是 ~270 MB 未压缩体积。
+      # 注意与 Windows 的不对称：--noinclude-qt-translations 在 mac 上并没有带走 Chromium 的
+      # qtwebengine_locales（它们在 framework/Resources 里，不走 translations 那条路径）。
+      # 其余 mac 体积按约定不动：QtWebEngineCore 本体 473,679,152（universal2，只有 1 份）、
+      # v8_context_snapshot 的 arm64 与 x86_64 各 694,265 —— 这些要靠改产物才能省，不做。
+      # --noinclude-dlls='*qpdf*' 在 mac 上同样只挡住 libqpdf.dylib（ignored="yes"），
+      # QtPdf framework 二进制仍以 "Used by libqpdf.dylib" 留着，和 Windows 一个毛病。
       - name: Build macOS
         if: runner.os == 'macOS'
         env:

@@ -6,14 +6,76 @@
 """
 import sys
 import ctypes
-from PySide6.QtCore import Qt, QUrl, QTimer
+from PySide6.QtCore import Qt, QUrl, QTimer, QObject, QFile, QIODevice, Signal, Slot
 from PySide6.QtWidgets import QMainWindow, QApplication
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEngineScript
+from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtGui import QCursor
 
 from utils.helpers import get_resource_path
 from core.mouse_hook import MouseTracker
 from core.tray import AppTray
+
+
+# 前端连接用的胶水脚本。
+# 前端 overlay.js 的对外接口（window.externalMove / externalBoom / externalUp /
+# updateColor）保持原样不动，这段脚本只负责把 QWebChannel 的信号转接到它们上面，
+# 因此不需要改动 web/ 下的任何文件。
+_BRIDGE_CONNECT_JS = """
+(function () {
+    'use strict';
+    // 没有 transport 说明 setWebChannel 没生效（例如脚本先于通道建立就跑了）
+    if (typeof qt === 'undefined' || !qt.webChannelTransport) { return; }
+    if (window.__basparkBridge) { return; }
+    new QWebChannel(qt.webChannelTransport, function (channel) {
+        var b = channel.objects.bridge;
+        if (!b) { return; }
+        window.__basparkBridge = b;
+        // 每次调用都重新判断函数是否存在：overlay.js 可能在资源就绪后才挂上这些接口，
+        // 语义与原先 runJavaScript 里的 if(window.externalMove) 完全一致。
+        b.moved.connect(function (x, y) {
+            if (typeof window.externalMove === 'function') { window.externalMove(x, y); }
+        });
+        b.clicked.connect(function (x, y) {
+            if (typeof window.externalBoom === 'function') { window.externalBoom(x, y); }
+        });
+        b.released.connect(function () {
+            if (typeof window.externalUp === 'function') { window.externalUp(); }
+        });
+        b.colorChanged.connect(function (rgb) {
+            if (typeof window.updateColor === 'function') { window.updateColor(rgb); }
+        });
+        // 握手：告诉 Python 侧"从现在起 emit 才有人接"
+        b.notifyReady();
+    });
+})();
+"""
+
+
+class FrontendBridge(QObject):
+    """Python -> 前端的数据通道（经 QWebChannel 暴露给 JS）。
+
+    数据是单向的：Python 发信号，JS 接收。唯一的反向调用是 notifyReady() 握手。
+
+    这样做替代了原先"每个鼠标事件都拼一条 JS 源码字符串交给 runJavaScript"的做法 ——
+    那种方式每次都要走一趟跨进程 IPC + 一次 V8 解析编译，而且坐标是拼进源码文本的。
+    改成信号后传的是结构化参数，省掉了字符串拼接与每次的脚本编译。
+    """
+
+    # 信号名会原样出现在 JS 侧（b.moved / b.clicked / ...）
+    moved = Signal(float, float)
+    clicked = Signal(float, float)
+    released = Signal()
+    colorChanged = Signal(str)
+
+    # 仅供 Python 内部使用的握手通知（同时也会被暴露给 JS，但前端不会用到）
+    ready = Signal()
+
+    @Slot()
+    def notifyReady(self):
+        """由前端胶水脚本在通道建立完成后调用。"""
+        self.ready.emit()
 
 
 class BASparkWindow(QMainWindow):
@@ -25,6 +87,13 @@ class BASparkWindow(QMainWindow):
         # 上一次发送给前端的坐标，用于去重
         self._last_sent_pos = (-1, -1)
         self.settings_window = None
+
+        # QWebChannel 相关状态
+        self.bridge = None            # FrontendBridge 实例（通道可用时才创建）
+        self.channel = None           # QWebChannel 实例
+        self._channel_ready = False   # 前端胶水脚本是否已完成握手
+        self._legacy_js = False       # 通道建立失败时回退到 runJavaScript
+        self._pending_color = None    # 通道就绪前用户改的配色，就绪后补发
 
         self._init_window_attributes()
         self._init_browser()
@@ -71,11 +140,69 @@ class BASparkWindow(QMainWindow):
         self.setCentralWidget(self.browser)
         self.browser.page().setBackgroundColor(Qt.GlobalColor.transparent)
 
+        # ★ 必须在 setUrl 之前建立通道 ★
+        # qt.webChannelTransport 是 WebEngine 在页面加载时注入的，只有在加载开始前
+        # 就设好 web channel，本次加载的页面里才会有 transport。
+        self._legacy_js = not self._init_bridge()
+
         html_path = get_resource_path("web/index.html")
         if html_path.exists():
             self.browser.setUrl(QUrl.fromLocalFile(str(html_path)))
 
+        # 页面重新加载时 JS 上下文会重建，旧的握手随之失效，必须把 ready 状态清掉，
+        # 否则会在新页面还没连上通道的空窗期里对着虚空 emit。
+        self.browser.loadStarted.connect(self._on_load_started)
         self.browser.loadFinished.connect(self._on_load_finished)
+
+    def _init_bridge(self) -> bool:
+        """建立 QWebChannel 并向前端注入连接脚本。
+
+        qwebchannel.js 以 Qt 资源形式随 WebChannel 模块分发（:/qtwebchannel/qwebchannel.js），
+        不需要往 web/ 里复制文件，也不会给打包产物增加体积。
+
+        Returns:
+            bool: 成功返回 True；失败（拿不到该 Qt 资源）返回 False，
+                  调用方将回退到旧的 runJavaScript 路径，功能不丢。
+        """
+        f = QFile(":/qtwebchannel/qwebchannel.js")
+        if not f.open(QIODevice.OpenModeFlag.ReadOnly):
+            print("[BASpark] 无法读取 :/qtwebchannel/qwebchannel.js，"
+                  "事件推送回退到 runJavaScript", file=sys.stderr)
+            return False
+        qwebchannel_src = bytes(f.readAll()).decode("utf-8")
+        f.close()
+
+        self.bridge = FrontendBridge(self)
+        self.bridge.ready.connect(self._on_bridge_ready)
+
+        self.channel = QWebChannel(self)
+        self.channel.registerObject("bridge", self.bridge)
+        self.browser.page().setWebChannel(self.channel)
+
+        # 注入到主世界（MainWorld）：胶水脚本要同时够到 qt.webChannelTransport、
+        # QWebChannel 构造器，以及页面自己的 window.externalMove 等接口。
+        # 注入点选 DocumentCreation：越早跑，首帧事件丢失的空窗期越短。
+        script = QWebEngineScript(self)
+        script.setName("baspark_bridge_connector")
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(False)
+        script.setSourceCode(qwebchannel_src + "\n;\n" + _BRIDGE_CONNECT_JS)
+        self.browser.page().scripts().insert(script)
+        return True
+
+    def _on_load_started(self):
+        """页面开始（重新）加载：JS 上下文即将重建，握手状态作废。"""
+        self._channel_ready = False
+
+    def _on_bridge_ready(self):
+        """前端胶水脚本握手完成：此后 emit 的信号才有人接收。"""
+        self._channel_ready = True
+        # 通道就绪前用户改过配色的话，此刻补发，避免"改了没生效"
+        if self._pending_color is not None:
+            rgb = self._pending_color
+            self._pending_color = None
+            self.bridge.colorChanged.emit(rgb)
 
     def _adapt_screen(self):
         """按平台铺满主屏显示。"""
@@ -139,7 +266,16 @@ class BASparkWindow(QMainWindow):
         Args:
             rgb_str (str): 形如 "76,167,255" 的 RGB 字符串。
         """
-        self.browser.page().runJavaScript(f"if(window.updateColor)window.updateColor('{rgb_str}');")
+        if self._legacy_js:
+            self.browser.page().runJavaScript(
+                f"if(window.updateColor)window.updateColor('{rgb_str}');")
+            return
+        if self._channel_ready:
+            self.bridge.colorChanged.emit(rgb_str)
+        else:
+            # 通道还没握手（典型场景：首启后立刻进设置改配色）。
+            # 先记下来，_on_bridge_ready 里补发，否则这次修改会被静默吞掉。
+            self._pending_color = rgb_str
 
     def _get_logic_pos(self):
         """将光标全局坐标换算为浏览器视图内的百分比坐标 (0.0 ~ 1.0)。"""
@@ -153,16 +289,24 @@ class BASparkWindow(QMainWindow):
         if bw == 0 or bh == 0:
             return 0.5, 0.5
 
-        # 用百分比表示，前端按视口尺寸还原为像素坐标
-        percent_x = local_pos.x() / bw
-        percent_y = local_pos.y() / bh
+        # 用百分比表示，前端按视口尺寸还原为像素坐标。
+        # 保留 5 位小数（2560px 宽的屏上约 0.026px 精度）：既缩小传输量，
+        # 也让 _last_sent_pos 的去重真正可能命中 —— 原始浮点几乎永不相等，
+        # 旧实现里这个去重基本是摆设。
+        percent_x = round(local_pos.x() / bw, 5)
+        percent_y = round(local_pos.y() / bh, 5)
 
         return percent_x, percent_y
 
     def _trigger_boom(self):
         """左键按下：在光标处触发前端点击特效。"""
         lx, ly = self._get_logic_pos()
-        self.browser.page().runJavaScript(f"if(window.externalBoom)window.externalBoom({lx},{ly});")
+        if self._channel_ready:
+            self.bridge.clicked.emit(lx, ly)
+        else:
+            # 通道未就绪（建立失败，或首启握手还没完成）时的回退路径
+            self.browser.page().runJavaScript(
+                f"if(window.externalBoom)window.externalBoom({lx},{ly});")
 
     def _trigger_move(self):
         """鼠标移动：向前端发送最新坐标。"""
@@ -171,11 +315,18 @@ class BASparkWindow(QMainWindow):
         if self._last_sent_pos == (lx, ly):
             return
         self._last_sent_pos = (lx, ly)
-        self.browser.page().runJavaScript(f"if(window.externalMove)window.externalMove({lx},{ly});")
+        if self._channel_ready:
+            self.bridge.moved.emit(lx, ly)
+        else:
+            self.browser.page().runJavaScript(
+                f"if(window.externalMove)window.externalMove({lx},{ly});")
 
     def _trigger_up(self):
         """左键释放：通知前端结束当前交互。"""
-        self.browser.page().runJavaScript("if(window.externalUp)window.externalUp();")
+        if self._channel_ready:
+            self.bridge.released.emit()
+        else:
+            self.browser.page().runJavaScript("if(window.externalUp)window.externalUp();")
 
     def show_settings_window(self):
         """打开设置面板，确保单例并显示在最前面，且默认打开‘关于’页面。"""
