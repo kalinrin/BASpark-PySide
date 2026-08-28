@@ -104,6 +104,56 @@ jobs:
           "$root\Scripts"  | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "PYTHON_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      # ★ CRT 必须满足 "vcruntime140 版本 >= 树里最新的 msvcp140" ★
+      # 上一版产物正好反了：msvcp140.dll 来自 VS2026 的 14.51 redist（Nuitka 按 --msvc=latest
+      # 选的工具链），而 vcruntime140.dll 来自自建 Python 的 layout（v143 时代）。同目录 DLL
+      # 优先加载，于是新 msvcp 配旧 vcruntime，用户机上可能直接
+      #   "无法定位程序输入点 XXX 于动态链接库 VCRUNTIME140.dll"
+      # 而构建机 System32 里有新版，这个故障永远复现不出来。
+      # 这里用 Nuitka 会选中的同一份 redist 覆盖 Python 根目录里的 vcruntime140*.dll，
+      # 让产物里的整套 CRT 同源同版本（新 vcruntime 向后兼容旧 msvcp，方向是安全的，
+      # 也顺带盖住 PySide6 自带的 shiboken6\msvcp140.dll 那份老的）。
+      - name: Align VC runtime with MSVC redist (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "找不到 vswhere.exe，无法定位 MSVC redist" }
+
+          # -latest 与 Nuitka 的 --msvc=latest 取同一个实例：windows-2025 上 VS2022 与 VS2026 并存，
+          # 挑中的是 VS2026(18.x)。两边必须用同一套判定，否则又是版本错配。
+          $inst = & $vswhere -latest -products * `
+                    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                    -property installationPath
+          if (-not $inst) { throw "找不到带 MSVC x64 工具链的 VS 实例" }
+          Write-Host "VS install : $inst"
+
+          $verDir = Get-ChildItem (Join-Path $inst 'VC\Redist\MSVC') -Directory |
+                    Where-Object { $_.Name -match '^\d+\.\d+\.\d+' } |
+                    Sort-Object { [version]($_.Name -replace '^(\d+\.\d+\.\d+).*$', '$1') } |
+                    Select-Object -Last 1
+          if (-not $verDir) { throw "找不到 VC\Redist\MSVC\<version> 目录" }
+          $crt = Get-ChildItem (Join-Path $verDir.FullName 'x64') -Directory -Filter 'Microsoft.VC*.CRT' |
+                 Select-Object -First 1
+          if (-not $crt) { throw "找不到 $($verDir.FullName)\x64\Microsoft.VC*.CRT" }
+          Write-Host "CRT redist : $($crt.FullName)"
+
+          $root = $env:PYTHON_ROOT
+          $copied = 0
+          Get-ChildItem $crt.FullName -Filter 'vcruntime140*.dll' | ForEach-Object {
+            $dst = Join-Path $root $_.Name
+            $old = if (Test-Path $dst) { (Get-Item $dst).VersionInfo.FileVersion } else { '(absent)' }
+            Copy-Item $_.FullName $dst -Force
+            Write-Host ("  {0}: {1}  ->  {2}" -f $_.Name, $old, (Get-Item $dst).VersionInfo.FileVersion)
+            $copied++
+          }
+          if ($copied -eq 0) { throw "redist 里没有 vcruntime140*.dll，CRT 对齐失败" }
+
+          # 换完必须验证解释器还能起来，不然这步等于把构建环境搞坏了才发现
+          & "$root\python.exe" -c "print('python OK after CRT swap')"
+          if ($LASTEXITCODE -ne 0) { throw "换 vcruntime 后 python.exe 起不来了" }
+
       - name: Set up custom Python (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -205,9 +255,22 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ccache || true
 
-      # --msvc=latest：runner 已钉在 windows-2025，latest 就是 VS2022 v143，与自建 CPython
-      # 的工具集一致。不写 --msvc=14.3 这种精确值，是因为它在 Nuitka 各版本里的匹配规则
-      # 不稳定（镜像上的 v143 实际是 14.4x），版本一致性交给 runner pin 来保证。
+      # --msvc=latest：windows-2025 镜像上 VS2022 与 VS2026 并存，latest 实际选中的是
+      # VS2026(v145 / 14.51) —— 证据是上一版 report 里 msvcp140.dll 的来源路径
+      # "...\Visual Studio\18\enterprise\VC\Redist\MSVC\14.51.36231\x64\microsoft.vc145.crt\"。
+      # 不钉 --msvc=14.3（v145 与 v143 的 CRT 官方向前兼容），而是用上面的
+      # "Align VC runtime" 步骤把 CRT 来源统一到同一份 redist。
+      #
+      # --noinclude-data-files 那三行的依据（上一版 report 实测）：
+      #   qtwebengine_devtools_resources.debug.pak   75.8 MB
+      #   qtwebengine_resources.debug.pak             2.3 MB
+      #   qtwebengine_resources_{100,200}p.debug.pak  0.3 MB
+      #   qtwebengine_devtools_resources.pak         11.6 MB  ← 非 debug 的 DevTools 前端
+      # 全是只有打开远程调试面板才会读的东西。onefile 体积（上一版 109 MB）掉得有限，
+      # 但缓存解包目录直接少 ~86 MB，首启解包时间同比例缩短。
+      # --noinclude-dlls=*qpdf*：imageformats 的 qpdf 插件是 qt6pdf.dll 的唯一引用者
+      # （report: reason="Used by 'PySide6\qt-plugins\imageformats\qpdf.dll'"），我们不需要
+      # 把 PDF 当图片加载。加完务必看新 report 里这些条目是否真的消失了。
       #
       # --onefile-cache-mode=cached + {CACHE_DIR}/BASpark/{VERSION}：
       # 默认 onefile 每次启动都要把 ~300MB（Qt6WebEngineCore + *.pak + icudtl.dat）解到
@@ -226,6 +289,9 @@ jobs:
           --output-filename=BASpark
           --enable-plugin=pyside6
           --noinclude-qt-translations
+          --noinclude-data-files="*.debug.pak"
+          --noinclude-data-files="*qtwebengine_devtools_resources*.pak"
+          --noinclude-dlls="*qpdf*"
           --include-data-dir=web=web
           --include-data-files=app.ico=app.ico
           --windows-icon-from-ico=app.ico
@@ -284,6 +350,9 @@ jobs:
           --output-dir=dist
           --enable-plugin=pyside6
           --noinclude-qt-translations
+          --noinclude-data-files='*.debug.pak'
+          --noinclude-data-files='*qtwebengine_devtools_resources*.pak'
+          --noinclude-dlls='*qpdf*'
           --include-data-dir=web=web
           --include-data-files=app.ico=app.ico
           --company-name=BASpark
