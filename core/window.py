@@ -182,7 +182,10 @@ class BASparkWindow(QMainWindow):
         # 注入到主世界（MainWorld）：胶水脚本要同时够到 qt.webChannelTransport、
         # QWebChannel 构造器，以及页面自己的 window.externalMove 等接口。
         # 注入点选 DocumentCreation：越早跑，首帧事件丢失的空窗期越短。
-        script = QWebEngineScript(self)
+        # 注意：当前 PySide6 版本的 QWebEngineScript 构造函数不接受 parent 位置参数
+        # （只支持拷贝构造或全关键字参数），这里必须无参构造。
+        # 脚本随后 insert 进 page 的 scripts() 集合，由该集合管理生命周期，无需 parent。
+        script = QWebEngineScript()
         script.setName("baspark_bridge_connector")
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
