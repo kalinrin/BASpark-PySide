@@ -10,6 +10,11 @@ env:
   PY_VERSION: "3.12.14"
   PY_DIST_BASE: "https://gls.kafornet.online/python"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # 应用版本：同时写进 Windows 版本资源、macOS Info.plist，
+  # 并作为 onefile 缓存解包目录名的一部分（{VERSION}）。发版时改这里。
+  APP_VERSION: "1.2.1"
+  # Nuitka 的 C 编译缓存（ccache/clcache/dll-dependencies）落到工作区，好被 actions/cache 收走
+  NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
 
 jobs:
   build:
@@ -19,7 +24,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          # 不要用 windows-latest：它正在向 VS2026(v18) 迁移，而自建 CPython 是 v143 编的，
+          # Nuitka 的 MSVC 探测同样靠 vswhere 挑版本，工具链漂移比 Python 漂移更难查。
+          - os: windows-2025
             artifact_name: BASpark-windows-64
             py_platform: win64
             py_ext: zip          # 包内直接是 python.exe / Lib，没有父目录
@@ -29,7 +36,7 @@ jobs:
             # 不要下调：PySide6 6.11 的绑定层（libpyside6 / libshiboken6 / PySide6/*.so）
             # 本身就是 minos 15.0（Qt 插件才是 13.0），下限由 wheel 决定，调低只会
             # 产生链接警告 + 让 Info.plist 的 LSMinimumSystemVersion 谎报版本。
-            # 真要降低门槛，唯一的办法是钉一个更老的 PySide6 版本。
+            # 自建 Python 的 MACOSX_DEPLOYMENT_TARGET 也是 15.0，两边刻意保持一致。
             deployment_target: "15.0"
             py_platform: macos-arm64
             py_ext: tar.gz       # 包内套一层 python-<ver>/，里面才是 bin、lib
@@ -63,7 +70,9 @@ jobs:
             Expand-Archive -Path $zip -DestinationPath $root -Force
           }
 
-          # 当前分发包解开就是 python.exe / Lib，这段只是兜底：万一以后多套了一层目录
+          # Windows 侧不需要"规范前缀"：PC\layout 的产物是真可搬家的
+          # （sysconfig 在 Windows 上运行期从 sys.prefix 推导，没有烘死的 LIBDIR/LIBPL）。
+          # 当前分发包解开就是 python.exe / Lib，这段只是兜底：万一以后多套了一层目录。
           if (-not (Test-Path "$root\python.exe")) {
             $inner = Get-ChildItem $root -Directory |
                      Where-Object { Test-Path "$($_.FullName)\python.exe" } |
@@ -79,10 +88,12 @@ jobs:
           # PC\layout 的 embed 预设才会生成 ._pth（它会禁用 site-packages）；default 预设没有，这里只是兜底
           Get-ChildItem $root -Filter "*._pth" -ErrorAction SilentlyContinue | Remove-Item -Force
 
-          # Nuitka 是真编译真链接，缺一样都跑不通，提前告警好定位
-          if (-not (Test-Path "$root\include\Python.h")) { Write-Host "::warning::缺少 include\Python.h（PC\layout 需带 --include-dev / --preset-default）" }
-          if (-not (Get-ChildItem "$root\libs" -Filter "python3*.lib" -ErrorAction SilentlyContinue)) { Write-Host "::warning::缺少 libs\python3*.lib，Nuitka 无法链接" }
-          if (-not (Test-Path "$root\Lib\os.py")) { Write-Host "::warning::Lib 下没有 .py 源码（只有 .pyc？）Nuitka 需要源码" }
+          # Nuitka 是真编译真链接，缺一样都跑不通，这几样直接拦死而不是告警
+          $mm = ($env:PY_VERSION.Split('.')[0]) + ($env:PY_VERSION.Split('.')[1])
+          if (-not (Test-Path "$root\include\Python.h")) { throw "缺少 include\Python.h（PC\layout 需 --preset-default）" }
+          if (-not (Test-Path "$root\libs\python$mm.lib")) { throw "缺少 libs\python$mm.lib，Nuitka 无法链接" }
+          if (-not (Test-Path "$root\Lib\os.py")) { throw "Lib 下没有 .py 源码（只有 .pyc？）Nuitka 需要源码" }
+          if (-not (Test-Path "$root\python$mm.dll")) { throw "缺少 python$mm.dll" }
 
           Write-Host "==== Python root: $root ===="
           Get-ChildItem $root | Select-Object Name | Out-String | Write-Host
@@ -97,90 +108,60 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          url="$PY_DIST_BASE/$PY_VERSION/python-$PY_VERSION-${{ matrix.py_platform }}.${{ matrix.py_ext }}"
-          pkg="$RUNNER_TEMP/python.${{ matrix.py_ext }}"
-          root="$RUNNER_TEMP/python"
+          fname="python-$PY_VERSION-${{ matrix.py_platform }}.${{ matrix.py_ext }}"
+          url="$PY_DIST_BASE/$PY_VERSION/$fname"
+          pkg="$RUNNER_TEMP/$fname"
+          # ★ 必须解到规范前缀 ★
+          # 这份包是 --prefix=/opt/python-<ver> + --enable-shared 构建的：sysconfig 的
+          # LIBPL/LIBDIR、bin/pip3 与 python3-config 的 shebang 全烘死了这个绝对路径，
+          # 而 Nuitka 正是靠 LIBDIR 找到并复制 libpython 进 dist 的。
+          # 生产端的 Nuitka 闸门也是在这个路径下跑通的，解到别处等于换了个未验证环境。
+          pyroot="/opt/python-$PY_VERSION"
+          pymm="${PY_VERSION%.*}"
 
           echo "Downloading $url"
           curl -fL --retry 3 --retry-delay 5 -o "$pkg" "$url"
-          rm -rf "$root"; mkdir -p "$root"
 
-          # 首选 bsdtar：一步解开 .tar.gz，且完整保留符号链接与可执行位
-          extract_ok=0
-          if tar -xzf "$pkg" -C "$root"; then extract_ok=1; fi
-
-          # 回退 7zz：它不认 .tar.gz 的两层结构，必须解两次（.tar.gz -> .tar -> python-<ver>/）
-          if [ "$extract_ok" -eq 0 ] && command -v 7zz >/dev/null 2>&1; then
-            echo "tar 解压失败，回退 7zz"
-            7zz x -y -o"$root" "$pkg" >/dev/null
-            inner="$(find "$root" -maxdepth 1 -type f -name '*.tar' | head -n 1 || true)"
-            if [ -n "$inner" ]; then
-              7zz x -y -o"$root" "$inner" >/dev/null
-              rm -f "$inner"
-              extract_ok=1
-            fi
+          # 分发端随包发了 .sha256，能取到就校验（取不到只告警，不拦构建）
+          if curl -fsSL --retry 2 -o "$pkg.sha256" "$url.sha256"; then
+            (cd "$RUNNER_TEMP" && shasum -a 256 -c "$fname.sha256")
+          else
+            echo "::warning::未取到 $fname.sha256，跳过完整性校验"
           fi
 
-          # 最后再兜一层 gzip + tar
-          if [ "$extract_ok" -eq 0 ]; then
-            gzip -dc "$pkg" | tar -xf - -C "$root" && extract_ok=1
-          fi
-          if [ "$extract_ok" -eq 0 ]; then
-            echo "::error::解压 $pkg 失败"; ls -la "$root"; exit 1
-          fi
-
-          echo "==== 解压结果 ===="
-          ls -la "$root"
-
-          # 定位真正的 Python 主目录（tar 包里套着一层 python-<ver>/）
-          pyroot=""
-          for d in "$root" "$root"/*; do
-            [ -d "$d" ] || continue
-            if [ -e "$d/bin/python3" ]; then pyroot="$d"; break; fi
-          done
-          if [ -z "$pyroot" ]; then
-            while IFS= read -r b; do
-              if [ -e "$b/python3" ]; then pyroot="$(dirname "$b")"; break; fi
-            done < <(find "$root" -maxdepth 4 -type d -name bin)
-          fi
-          if [ -z "$pyroot" ]; then
-            echo "::error::未找到 bin/python3，解压结果如下："
-            find "$root" -maxdepth 3 | head -n 60
-            exit 1
+          sudo mkdir -p /opt
+          sudo rm -rf "$pyroot"
+          # bsdtar 一步解 .tar.gz，完整保留符号链接、可执行位与 ad-hoc 签名；
+          # 包内顶层就是 python-<ver>/，所以 -C /opt 正好落到规范前缀。
+          sudo tar -xzf "$pkg" -C /opt || { gzip -dc "$pkg" | sudo tar -xf - -C /opt; }
+          if [ ! -x "$pyroot/bin/python3" ]; then
+            echo "::error::$pyroot/bin/python3 不存在"; ls -la /opt; exit 1
           fi
 
-          bindir="$pyroot/bin"
-          chmod -R u+w "$pyroot" || true
-          chmod +x "$bindir"/* 2>/dev/null || true
+          # 解出来归 root，后面 pip install 会 EACCES —— 交回当前用户
+          sudo chown -R "$(id -u):$(id -g)" "$pyroot"
+          # 包里只有 python3，补个 python 让两个平台的命令统一
+          [ -e "$pyroot/bin/python" ] || ln -s python3 "$pyroot/bin/python"
           xattr -dr com.apple.quarantine "$pyroot" 2>/dev/null || true
 
-          # make install 只生成 python3，这里补一个 python 软链，两个平台命令就能统一
-          if [ ! -e "$bindir/python" ]; then ln -s "$bindir/python3" "$bindir/python"; fi
-
-          # 搬家后 sysconfig 里记的仍是编译期 prefix（Nuitka 找 libpython/头文件、
-          # bin/pip3 的 shebang 都依赖它），做个同名软链最省事
-          build_prefix="$("$bindir/python3" -c 'import sysconfig;print(sysconfig.get_config_var("prefix") or "")' 2>/dev/null || true)"
-          if [ -n "$build_prefix" ] && [ "$build_prefix" != "$pyroot" ] && [ ! -e "$build_prefix" ]; then
-            sudo mkdir -p "$(dirname "$build_prefix")" 2>/dev/null || true
-            sudo ln -s "$pyroot" "$build_prefix" 2>/dev/null && echo "compat symlink: $build_prefix -> $pyroot" || true
+          "$pyroot/bin/python3" -VV
+          # 闸门 1：LIBPL/LIBDIR/INCLUDEPY 必须真实存在，否则 Nuitka 找不到 libpython 与头文件
+          "$pyroot/bin/python3" - <<'PYEOF'
+          import os, sysconfig
+          for k in ("LIBPL", "LIBDIR", "INCLUDEPY"):
+              v = sysconfig.get_config_var(k)
+              print(f"{k:<10}: {v}  exists={os.path.isdir(v or '')}")
+              assert os.path.isdir(v), f"{k} 不存在 —— 没解到规范前缀 /opt/python-<ver>？"
+          print("Py_ENABLE_SHARED:", sysconfig.get_config_var("Py_ENABLE_SHARED"))
+          PYEOF
+          test -e "$pyroot/lib/libpython$pymm.dylib"
+          # 闸门 2：树里绝不能有 libpython*.a —— 它会让 Nuitka 走静态链接，叠加 LTO
+          # 之后就是 "symbol not found in flat namespace '_PyBool_Type'" 那个崩溃。
+          if find "$pyroot" -name 'libpython*.a' -print | grep -q .; then
+            echo "::error::包里残留 libpython*.a，Nuitka 会静态链接并在运行时崩溃"; exit 1
           fi
 
-          # arm64 上没有有效签名的 Mach-O 会被直接 SIGKILL，跑不起来就 ad-hoc 重签一次
-          if ! "$bindir/python3" -VV; then
-            echo "::warning::python3 无法执行，尝试 ad-hoc 重新签名"
-            find "$pyroot" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -u+x \) -print0 \
-              | xargs -0 -n 40 codesign --force --sign - 2>/dev/null || true
-            "$bindir/python3" -VV
-          fi
-
-          # Nuitka 需要头文件与 libpython
-          [ -e "$pyroot/include/python3.12/Python.h" ] || echo "::warning::缺少 include/python3.12/Python.h"
-          ls "$pyroot"/lib/libpython3.12.* >/dev/null 2>&1 || echo "::warning::$pyroot/lib 下没有 libpython3.12.*"
-
-          echo "==== Python root: $pyroot ===="
-          ls -la "$pyroot"
-
-          echo "$bindir" >> "$GITHUB_PATH"
+          echo "$pyroot/bin" >> "$GITHUB_PATH"
           echo "PYTHON_ROOT=$pyroot" >> "$GITHUB_ENV"
 
       - name: Bootstrap pip
@@ -190,9 +171,11 @@ jobs:
           which python
           python -VV
           python -c "import sys; print(sys.executable); print(sys.prefix)"
-          # 关键模块自检：mac 那份用的是静态 openssl/lzma，顺便验证整棵树搬家后仍然可用
+          # 关键模块自检：mac 那份用的是静态 openssl/lzma/sqlite/zlib，
+          # 顺便验证"只依赖 /usr/lib 与 /System/Library"这条不变量在搬家后依然成立
           python -c "import ssl, lzma, sqlite3, ctypes, zlib, bz2, hashlib; print('modules OK', ssl.OPENSSL_VERSION)"
-          # 全程用 python -m pip：mac 包里的 bin/pip3 shebang 写死了编译期前缀，直接调用可能失败
+          # 全程用 python -m pip：mac 包里的 bin/pip3 shebang 写死了 /opt/python-<ver>，
+          # 虽然我们已经解到该路径、pip3 可用，但统一走 -m 更省心
           python -m pip --version || python -m ensurepip --default-pip
           python -m pip --version
           python -m pip install --upgrade pip
@@ -206,11 +189,36 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install nuitka zstandard imageio
           python -m pip list
+          python -m nuitka --version
 
+      # C 编译产物缓存：代码变了 key 就变，但 restore-keys 前缀能复用大部分对象文件。
+      # Windows+MSVC 走内置 clcache，macOS 走下一步安装的 ccache，都落在 NUITKA_CACHE_DIR。
+      - name: Cache Nuitka C objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.nuitka-cache
+          key: nuitka-${{ runner.os }}-${{ env.PY_VERSION }}-${{ hashFiles('**/*.py', 'requirements.txt') }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-${{ env.PY_VERSION }}-
+
+      - name: Install ccache (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ccache || true
+
+      # --msvc=latest：runner 已钉在 windows-2025，latest 就是 VS2022 v143，与自建 CPython
+      # 的工具集一致。不写 --msvc=14.3 这种精确值，是因为它在 Nuitka 各版本里的匹配规则
+      # 不稳定（镜像上的 v143 实际是 14.4x），版本一致性交给 runner pin 来保证。
+      #
+      # --onefile-cache-mode=cached + {CACHE_DIR}/BASpark/{VERSION}：
+      # 默认 onefile 每次启动都要把 ~300MB（Qt6WebEngineCore + *.pak + icudtl.dat）解到
+      # %TEMP% 再删掉，这是 WebEngine 类 onefile 启动奇慢的唯一原因。改成带版本号的固定
+      # 缓存目录后，只有首启解包一次，之后是秒开。代价：%LOCALAPPDATA% 常驻 300MB，
+      # 且升级换版本号后旧目录不会自动清理。
       - name: Build Windows
         if: runner.os == 'Windows'
         run: >
-          python -m nuitka --onefile
+          python -m nuitka --mode=onefile
+          --msvc=latest
           --windows-console-mode=disable
           --windows-uac-admin
           --assume-yes-for-downloads
@@ -221,22 +229,29 @@ jobs:
           --include-data-dir=web=web
           --include-data-files=app.ico=app.ico
           --windows-icon-from-ico=app.ico
+          --company-name=BASpark
+          --product-name=BASpark
+          --product-version=${{ env.APP_VERSION }}
+          --file-version=${{ env.APP_VERSION }}
+          --file-description="BASpark Desktop Overlay"
+          --copyright="Copyright (c) 2025 BASpark"
+          --onefile-cache-mode=cached
+          --onefile-tempdir-spec="{CACHE_DIR}/BASpark/{VERSION}"
           --python-flag=no_asserts
           --python-flag=no_docstrings
+          --python-flag=no_annotations
+          --python-flag=static_hashes
           --lto=yes
+          --report=compilation-report-windows.xml
           --nofollow-import-to=PySide6.Qt3DCore
           --nofollow-import-to=PySide6.Qt3DRender
-          --nofollow-import-to=PySide6.QtQml
-          --nofollow-import-to=PySide6.QtQuick
           --nofollow-import-to=PySide6.QtSql
           --nofollow-import-to=PySide6.QtSensors
           --nofollow-import-to=PySide6.QtBluetooth
           --nofollow-import-to=PySide6.QtNfc
           --nofollow-import-to=PySide6.QtMultimedia
           --nofollow-import-to=PySide6.QtMultimediaWidgets
-          --nofollow-import-to=PySide6.QtPositioning
           --nofollow-import-to=PySide6.QtTest
-          --nofollow-import-to=PySide6.QtXml
           main.py
 
       - name: Prepare Windows
@@ -246,40 +261,67 @@ jobs:
           if (Test-Path "dist/main.exe") { Rename-Item "dist/main.exe" "BASpark.exe" }
           if (Test-Path "dist/BASpark.exe") { Move-Item "dist/BASpark.exe" "./BASpark.exe" }
 
+      # --mode=app = standalone + macOS app bundle（onefile 与 app bundle 在 macOS 上不能共存）。
+      # --static-libpython=no 是硬要求，不是优化：静态 libpython + LTO 会把 CPython 符号裁掉，
+      # 运行时报 symbol not found in flat namespace '_PyBool_Type'（最初那个"启动即退"）。
+      # 现在靠"包里没有 .a"隐式走动态链接，这里显式钉死，防止哪天上游又装回 .a。
+      # --macos-signed-app-name 定下来就别再改：pynput 的全局鼠标监听要"输入监控/辅助功能"
+      # 授权，LaunchAgent 自启也认这个 bundle id，改一次用户就得重新授权一次。
       - name: Build macOS
         if: runner.os == 'macOS'
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: >
-          python -m nuitka --standalone
-          --macos-create-app-bundle
+          python -m nuitka --mode=app
           --macos-app-name=BASpark
+          --macos-app-version=${{ env.APP_VERSION }}
+          --macos-signed-app-name=com.kalinrin.baspark
           --macos-app-mode=gui
           --macos-target-arch=${{ matrix.mac_arch }}
+          --macos-app-icon=app.icns
+          --static-libpython=no
           --assume-yes-for-downloads
           --output-dir=dist
           --enable-plugin=pyside6
           --noinclude-qt-translations
           --include-data-dir=web=web
           --include-data-files=app.ico=app.ico
-          --macos-app-icon=app.icns
+          --company-name=BASpark
+          --product-name=BASpark
+          --product-version=${{ env.APP_VERSION }}
           --python-flag=no_asserts
           --python-flag=no_docstrings
+          --python-flag=no_annotations
+          --python-flag=static_hashes
           --lto=yes
+          --report=compilation-report-macos.xml
           --nofollow-import-to=PySide6.Qt3DCore
           --nofollow-import-to=PySide6.Qt3DRender
-          --nofollow-import-to=PySide6.QtQml
-          --nofollow-import-to=PySide6.QtQuick
           --nofollow-import-to=PySide6.QtSql
           --nofollow-import-to=PySide6.QtSensors
           --nofollow-import-to=PySide6.QtBluetooth
           --nofollow-import-to=PySide6.QtNfc
           --nofollow-import-to=PySide6.QtMultimedia
           --nofollow-import-to=PySide6.QtMultimediaWidgets
-          --nofollow-import-to=PySide6.QtPositioning
           --nofollow-import-to=PySide6.QtTest
-          --nofollow-import-to=PySide6.QtXml
           main.py
+
+      # bundle 里必须带着动态 libpython，否则就是静态链接生效了（见上面的 _PyBool_Type）。
+      - name: Assert dynamic libpython in bundle
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          pymm="${PY_VERSION%.*}"
+          app="$(ls -d dist/*.app | head -n 1)"
+          echo "bundle: $app"
+          # 不写死 Contents/MacOS：Nuitka 各版本调整过 bundle 内布局，全树搜更稳
+          found="$(find "$app" -name "libpython$pymm*.dylib" -print | head -n 5)"
+          if [ -z "$found" ]; then
+            echo "::error::bundle 里没有 libpython$pymm*.dylib —— Nuitka 静态链接了解释器"
+            find "$app" -maxdepth 3 | head -n 40
+            exit 1
+          fi
+          echo "$found"
 
       - name: Verify minimum macOS version
         if: runner.os == 'macOS'
@@ -298,9 +340,11 @@ jobs:
       - name: Package macOS
         if: runner.os == 'macOS'
         run: |
+          set -euo pipefail
           cd dist
           if [ -d "main.app" ]; then mv main.app BASpark.app; fi
-          zip -ry ../${{ matrix.artifact_name }}.zip BASpark.app
+          # ditto 是 Apple 推荐的 bundle 打包方式：符号链接、权限、签名都不会被破坏
+          ditto -c -k --sequesterRsrc --keepParent BASpark.app "../${{ matrix.artifact_name }}.zip"
 
       - name: Upload Windows Artifact
         if: runner.os == 'Windows'
@@ -308,6 +352,7 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: "BASpark.exe"
+          if-no-files-found: error
 
       - name: Upload macOS Artifact
         if: runner.os == 'macOS'
@@ -315,3 +360,13 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: "*.zip"
+          if-no-files-found: error
+
+      # 体积/依赖审计用：想知道"到底打包了什么"就看这个，别靠猜 --nofollow-import-to
+      - name: Upload compilation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-report
+          path: "compilation-report-*.xml"
+          if-no-files-found: warn
