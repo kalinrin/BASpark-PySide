@@ -245,59 +245,6 @@ jobs:
           python -m pip list
           python -m nuitka --version
 
-      # ★ 依赖装完后再收一次口，并且把"对齐成功"变成日志里可验证的事实 ★
-      # 上一版 report 实测：shiboken6\msvcp140{,_1,_2,_codecvt_ids}.dll 四份的来源都是
-      # ${sys.prefix}\Lib\site-packages\shiboken6\（PySide6 wheel 自带，v143 时代），
-      # 而根目录那几份 msvcp140* 是 Nuitka 从 VS2026 的 14.51 redist 复制的。
-      # CPython 在 Windows 上用 LOAD_WITH_ALTERED_SEARCH_PATH 加载扩展模块，扩展所在目录
-      # 优先：于是 shiboken6\Shiboken.pyd 绑同目录那份旧 msvcp140，而根目录的
-      # shiboken6.abi3.dll 绑新的 —— 同一个进程里两个 C++ 运行时实例、两套 locale/iostream
-      # 状态，而这两个模块之间恰恰在大量传 C++ 对象。
-      # 另一个必须做这步的理由：report 里记的永远是"替换前的源路径"，同一个路径原地换内容
-      # 在 report 里完全看不出来，所以 CRT 对齐这件事只能靠这里的日志 + 断言来验收。
-      # 只替换树里已存在的同名文件（不新增 DLL），最后硬断言"全树只剩一个版本号"。
-      - name: Unify CRT across the tree (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $crt  = $env:MSVC_CRT_REDIST
-          $root = $env:PYTHON_ROOT
-          if (-not $crt -or -not (Test-Path $crt)) { throw "MSVC_CRT_REDIST 无效: $crt" }
-          Write-Host "CRT redist : $crt"
-          Write-Host "Python root: $root"
-
-          $targets = @(Get-ChildItem $root -Recurse -File -Include 'msvcp140*.dll','vcruntime140*.dll')
-          if ($targets.Count -eq 0) { throw "树里一个 CRT DLL 都没有，PYTHON_ROOT 不对？" }
-
-          $unmatched = @()
-          foreach ($t in $targets) {
-            $src = Join-Path $crt $t.Name
-            if (Test-Path $src) {
-              $old = (Get-Item $t.FullName).VersionInfo.FileVersion
-              Copy-Item $src $t.FullName -Force
-              Write-Host ("  {0,-26} {1,-18} -> {2,-18} {3}" -f $t.Name, $old,
-                          (Get-Item $t.FullName).VersionInfo.FileVersion,
-                          $t.DirectoryName.Replace($root, '<root>'))
-            } else {
-              $unmatched += $t.FullName
-            }
-          }
-          foreach ($u in $unmatched) { Write-Host "::warning::redist 里没有同名文件，未对齐: $u" }
-
-          # 全树只允许一个 CRT 版本号：混版在构建机上永远正常（System32 有新版兜着），
-          # 到用户机上才炸成"无法定位程序输入点 ... 于 VCRUNTIME140.dll"
-          $vers = @(Get-ChildItem $root -Recurse -File -Include 'msvcp140*.dll','vcruntime140*.dll' |
-                    ForEach-Object { (Get-Item $_.FullName).VersionInfo.FileVersion } |
-                    Sort-Object -Unique)
-          Write-Host "CRT versions in tree: $($vers -join ' | ')"
-          if ($vers.Count -ne 1) { throw "树里存在多个 CRT 版本: $($vers -join ' | ')" }
-
-          # 换完必须能真正加载：这一行会把根目录的 shiboken6.abi3.dll 与
-          # shiboken6\Shiboken.pyd 连同两处 msvcp140 一起拉起来，是对上面替换最直接的验证
-          python -c "from PySide6 import QtCore; print('PySide6 OK', QtCore.qVersion())"
-          if ($LASTEXITCODE -ne 0) { throw "统一 CRT 后 PySide6 加载失败" }
-
       # C 编译产物缓存：代码变了 key 就变，但 restore-keys 前缀能复用大部分对象文件。
       # Windows+MSVC 走内置 clcache，macOS 走下一步安装的 ccache，都落在 NUITKA_CACHE_DIR。
       - name: Cache Nuitka C objects
