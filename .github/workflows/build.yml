@@ -6,14 +6,10 @@ on:
   workflow_dispatch:
 
 env:
-  # 自建 Python 的版本与分发地址，升级时只改这两行
   PY_VERSION: "3.12.14"
   PY_DIST_BASE: "https://gls.kafornet.online/python"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  # 应用版本：同时写进 Windows 版本资源、macOS Info.plist，
-  # 并作为 onefile 缓存解包目录名的一部分（{VERSION}）。发版时改这里。
   APP_VERSION: "1.3.0"
-  # Nuitka 的 C 编译缓存（ccache/clcache/dll-dependencies）落到工作区，好被 actions/cache 收走
   NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
 
 jobs:
@@ -24,22 +20,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 不要用 windows-latest：它正在向 VS2026(v18) 迁移，而自建 CPython 是 v143 编的，
-          # Nuitka 的 MSVC 探测同样靠 vswhere 挑版本，工具链漂移比 Python 漂移更难查。
           - os: windows-2025
             artifact_name: BASpark-windows-64
             py_platform: win64
-            py_ext: zip          # 包内直接是 python.exe / Lib，没有父目录
+            py_ext: zip
           - os: macos-26
             artifact_name: BASpark-macos-arm64
             mac_arch: arm64
-            # 不要下调：PySide6 6.11 的绑定层（libpyside6 / libshiboken6 / PySide6/*.so）
-            # 本身就是 minos 15.0（Qt 插件才是 13.0），下限由 wheel 决定，调低只会
-            # 产生链接警告 + 让 Info.plist 的 LSMinimumSystemVersion 谎报版本。
-            # 自建 Python 的 MACOSX_DEPLOYMENT_TARGET 也是 15.0，两边刻意保持一致。
             deployment_target: "15.0"
             py_platform: macos-arm64
-            py_ext: tar.gz       # 包内套一层 python-<ver>/，里面才是 bin、lib
+            py_ext: tar.gz
 
     steps:
       - name: Checkout Code
@@ -59,7 +49,6 @@ jobs:
           if (Test-Path $root) { Remove-Item $root -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $root | Out-Null
 
-          # bsdtar 解 zip 比 Expand-Archive 快得多，失败再回退
           $extracted = $false
           try {
             tar -xf "$zip" -C "$root"
@@ -70,9 +59,6 @@ jobs:
             Expand-Archive -Path $zip -DestinationPath $root -Force
           }
 
-          # Windows 侧不需要"规范前缀"：PC\layout 的产物是真可搬家的
-          # （sysconfig 在 Windows 上运行期从 sys.prefix 推导，没有烘死的 LIBDIR/LIBPL）。
-          # 当前分发包解开就是 python.exe / Lib，这段只是兜底：万一以后多套了一层目录。
           if (-not (Test-Path "$root\python.exe")) {
             $inner = Get-ChildItem $root -Directory |
                      Where-Object { Test-Path "$($_.FullName)\python.exe" } |
@@ -85,10 +71,8 @@ jobs:
             exit 1
           }
 
-          # PC\layout 的 embed 预设才会生成 ._pth（它会禁用 site-packages）；default 预设没有，这里只是兜底
           Get-ChildItem $root -Filter "*._pth" -ErrorAction SilentlyContinue | Remove-Item -Force
 
-          # Nuitka 是真编译真链接，缺一样都跑不通，这几样直接拦死而不是告警
           $mm = ($env:PY_VERSION.Split('.')[0]) + ($env:PY_VERSION.Split('.')[1])
           if (-not (Test-Path "$root\include\Python.h")) { throw "缺少 include\Python.h（PC\layout 需 --preset-default）" }
           if (-not (Test-Path "$root\libs\python$mm.lib")) { throw "缺少 libs\python$mm.lib，Nuitka 无法链接" }
@@ -104,16 +88,6 @@ jobs:
           "$root\Scripts"  | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "PYTHON_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ★ CRT 必须满足 "vcruntime140 版本 >= 树里最新的 msvcp140" ★
-      # 上一版产物正好反了：msvcp140.dll 来自 VS2026 的 14.51 redist（Nuitka 按 --msvc=latest
-      # 选的工具链），而 vcruntime140.dll 来自自建 Python 的 layout（v143 时代）。同目录 DLL
-      # 优先加载，于是新 msvcp 配旧 vcruntime，用户机上可能直接
-      #   "无法定位程序输入点 XXX 于动态链接库 VCRUNTIME140.dll"
-      # 而构建机 System32 里有新版，这个故障永远复现不出来。
-      # 这里用 Nuitka 会选中的同一份 redist 覆盖 Python 根目录里的 vcruntime140*.dll。
-      # 方向必须是"升 vcruntime"而不是"降 msvcp"：新 vcruntime 兼容旧 msvcp，反之不行。
-      # 注意这步只管 Python 根目录 —— 此刻 PySide6 还没装，site-packages\shiboken6 下那
-      # 4 份 v143 时代的 msvcp140* 还不存在，它们由 "Unify CRT across the tree" 那步收口。
       - name: Align VC runtime with MSVC redist (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -122,8 +96,6 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path $vswhere)) { throw "找不到 vswhere.exe，无法定位 MSVC redist" }
 
-          # -latest 与 Nuitka 的 --msvc=latest 取同一个实例：windows-2025 上 VS2022 与 VS2026 并存，
-          # 挑中的是 VS2026(18.x)。两边必须用同一套判定，否则又是版本错配。
           $inst = & $vswhere -latest -products * `
                     -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
                     -property installationPath
@@ -139,8 +111,6 @@ jobs:
                  Select-Object -First 1
           if (-not $crt) { throw "找不到 $($verDir.FullName)\x64\Microsoft.VC*.CRT" }
           Write-Host "CRT redist : $($crt.FullName)"
-          # 交给后面的 "Unify CRT across the tree"：两步必须用同一份 redist，
-          # 各自跑一遍 vswhere 就有再次错配的可能
           "MSVC_CRT_REDIST=$($crt.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           $root = $env:PYTHON_ROOT
@@ -154,7 +124,6 @@ jobs:
           }
           if ($copied -eq 0) { throw "redist 里没有 vcruntime140*.dll，CRT 对齐失败" }
 
-          # 换完必须验证解释器还能起来，不然这步等于把构建环境搞坏了才发现
           & "$root\python.exe" -c "print('python OK after CRT swap')"
           if ($LASTEXITCODE -ne 0) { throw "换 vcruntime 后 python.exe 起不来了" }
 
@@ -165,18 +134,12 @@ jobs:
           fname="python-$PY_VERSION-${{ matrix.py_platform }}.${{ matrix.py_ext }}"
           url="$PY_DIST_BASE/$PY_VERSION/$fname"
           pkg="$RUNNER_TEMP/$fname"
-          # ★ 必须解到规范前缀 ★
-          # 这份包是 --prefix=/opt/python-<ver> + --enable-shared 构建的：sysconfig 的
-          # LIBPL/LIBDIR、bin/pip3 与 python3-config 的 shebang 全烘死了这个绝对路径，
-          # 而 Nuitka 正是靠 LIBDIR 找到并复制 libpython 进 dist 的。
-          # 生产端的 Nuitka 闸门也是在这个路径下跑通的，解到别处等于换了个未验证环境。
           pyroot="/opt/python-$PY_VERSION"
           pymm="${PY_VERSION%.*}"
 
           echo "Downloading $url"
           curl -fL --retry 3 --retry-delay 5 -o "$pkg" "$url"
 
-          # 分发端随包发了 .sha256，能取到就校验（取不到只告警，不拦构建）
           if curl -fsSL --retry 2 -o "$pkg.sha256" "$url.sha256"; then
             (cd "$RUNNER_TEMP" && shasum -a 256 -c "$fname.sha256")
           else
@@ -185,21 +148,16 @@ jobs:
 
           sudo mkdir -p /opt
           sudo rm -rf "$pyroot"
-          # bsdtar 一步解 .tar.gz，完整保留符号链接、可执行位与 ad-hoc 签名；
-          # 包内顶层就是 python-<ver>/，所以 -C /opt 正好落到规范前缀。
           sudo tar -xzf "$pkg" -C /opt || { gzip -dc "$pkg" | sudo tar -xf - -C /opt; }
           if [ ! -x "$pyroot/bin/python3" ]; then
             echo "::error::$pyroot/bin/python3 不存在"; ls -la /opt; exit 1
           fi
 
-          # 解出来归 root，后面 pip install 会 EACCES —— 交回当前用户
           sudo chown -R "$(id -u):$(id -g)" "$pyroot"
-          # 包里只有 python3，补个 python 让两个平台的命令统一
           [ -e "$pyroot/bin/python" ] || ln -s python3 "$pyroot/bin/python"
           xattr -dr com.apple.quarantine "$pyroot" 2>/dev/null || true
 
           "$pyroot/bin/python3" -VV
-          # 闸门 1：LIBPL/LIBDIR/INCLUDEPY 必须真实存在，否则 Nuitka 找不到 libpython 与头文件
           "$pyroot/bin/python3" - <<'PYEOF'
           import os, sysconfig
           for k in ("LIBPL", "LIBDIR", "INCLUDEPY"):
@@ -209,8 +167,6 @@ jobs:
           print("Py_ENABLE_SHARED:", sysconfig.get_config_var("Py_ENABLE_SHARED"))
           PYEOF
           test -e "$pyroot/lib/libpython$pymm.dylib"
-          # 闸门 2：树里绝不能有 libpython*.a —— 它会让 Nuitka 走静态链接，叠加 LTO
-          # 之后就是 "symbol not found in flat namespace '_PyBool_Type'" 那个崩溃。
           if find "$pyroot" -name 'libpython*.a' -print | grep -q .; then
             echo "::error::包里残留 libpython*.a，Nuitka 会静态链接并在运行时崩溃"; exit 1
           fi
@@ -225,11 +181,7 @@ jobs:
           which python
           python -VV
           python -c "import sys; print(sys.executable); print(sys.prefix)"
-          # 关键模块自检：mac 那份用的是静态 openssl/lzma/sqlite/zlib，
-          # 顺便验证"只依赖 /usr/lib 与 /System/Library"这条不变量在搬家后依然成立
           python -c "import ssl, lzma, sqlite3, ctypes, zlib, bz2, hashlib; print('modules OK', ssl.OPENSSL_VERSION)"
-          # 全程用 python -m pip：mac 包里的 bin/pip3 shebang 写死了 /opt/python-<ver>，
-          # 虽然我们已经解到该路径、pip3 可用，但统一走 -m 更省心
           python -m pip --version || python -m ensurepip --default-pip
           python -m pip --version
           python -m pip install --upgrade pip
@@ -245,8 +197,6 @@ jobs:
           python -m pip list
           python -m nuitka --version
 
-      # C 编译产物缓存：代码变了 key 就变，但 restore-keys 前缀能复用大部分对象文件。
-      # Windows+MSVC 走内置 clcache，macOS 走下一步安装的 ccache，都落在 NUITKA_CACHE_DIR。
       - name: Cache Nuitka C objects
         uses: actions/cache@v4
         with:
@@ -259,36 +209,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ccache || true
 
-      # --msvc=latest：windows-2025 镜像上 VS2022 与 VS2026 并存，latest 实际选中的是
-      # VS2026(v145 / 14.51) —— 证据是上一版 report 里 msvcp140.dll 的来源路径
-      # "...\Visual Studio\18\enterprise\VC\Redist\MSVC\14.51.36231\x64\microsoft.vc145.crt\"。
-      # 不钉 --msvc=14.3（v145 与 v143 的 CRT 官方向前兼容），而是用 "Align VC runtime"
-      # + "Unify CRT across the tree" 两步把 CRT 来源统一到同一份 redist 并断言只剩一个版本。
-      #
-      # --noinclude-data-files 两行：已由 1.2.1 那版 report 验收 ✔
-      #   删之前（实测大小）：qtwebengine_devtools_resources.debug.pak 75.8 MB /
-      #   qtwebengine_resources.debug.pak 2.3 MB / *_{100,200}p.debug.pak 0.3 MB /
-      #   qtwebengine_devtools_resources.pak 11.6 MB —— 全是只有打开远程调试面板才读的东西。
-      #   删之后：data_file 只剩 icudtl.dat 10,467,680 / qtwebengine_resources.pak 2,268,263 /
-      #   _100p 151,066 / _200p 195,754 / v8_context_snapshot.bin 693,957；搜 debug.pak 与
-      #   devtools 都是 0 条。onefile_binary 114,701,824 -> 94,532,096（-19.2 MiB / -17.6%），
-      #   缓存解包目录少 ~86 MB。
-      #   （曾担心"过滤器匹配的是目标路径，而这些 pak 是 pyside6 插件以 Qt resources 身份
-      #   加进来的，未必拦得住" —— 实测拦得住，不需要改用 package-config yaml。）
-      # --noinclude-dlls=*qpdf*：qpdf.dll 已 ignored="yes" ✔，但它拖进来的 qt6pdf.dll 还在，
-      #   reason 依旧是 "Used by 'PySide6\qt-plugins\imageformats\qpdf.dll'" —— Nuitka 是先记
-      #   依赖边、后判 ignore，孤儿不回收。想再省 ~10 MB 可加 --noinclude-dlls="qt6pdf.dll"，
-      #   但残余风险要认：report 每个 DLL 只记一个 reason，证明不了 QtPrintSupport 之类没有
-      #   第二个引用者，猜错就是用户机上"启动即缺 DLL"。本轮故意不加。
-      # --noinclude-qt-translations：Windows 侧把 Chromium 的 qtwebengine_locales 也一起带走了
-      #   （新 report 里 0 条 locale pak；mac 侧一份不少，见下面 macOS 段的对照）。纯本地
-      #   HTML 能跑；若出现右键菜单/错误页乱码或空白，第一嫌疑就是这条。
-      #
-      # --onefile-cache-mode=cached + {CACHE_DIR}/BASpark/{VERSION}：
-      # 默认 onefile 每次启动都要把 ~300MB（Qt6WebEngineCore + *.pak + icudtl.dat）解到
-      # %TEMP% 再删掉，这是 WebEngine 类 onefile 启动奇慢的唯一原因。改成带版本号的固定
-      # 缓存目录后，只有首启解包一次，之后是秒开。代价：%LOCALAPPDATA% 常驻 300MB，
-      # 且升级换版本号后旧目录不会自动清理。
       - name: Build Windows
         if: runner.os == 'Windows'
         run: >
@@ -339,28 +259,6 @@ jobs:
           if (Test-Path "dist/main.exe") { Rename-Item "dist/main.exe" "BASpark.exe" }
           if (Test-Path "dist/BASpark.exe") { Move-Item "dist/BASpark.exe" "./BASpark.exe" }
 
-      # --mode=app = standalone + macOS app bundle（onefile 与 app bundle 在 macOS 上不能共存）。
-      # --static-libpython=no 是硬要求，不是优化：静态 libpython + LTO 会把 CPython 符号裁掉，
-      # 运行时报 symbol not found in flat namespace '_PyBool_Type'（最初那个"启动即退"）。
-      # 现在靠"包里没有 .a"隐式走动态链接，这里显式钉死，防止哪天上游又装回 .a。
-      # --macos-signed-app-name 定下来就别再改：pynput 的全局鼠标监听要"输入监控/辅助功能"
-      # 授权，LaunchAgent 自启也认这个 bundle id，改一次用户就得重新授权一次。
-      #
-      # mac 侧那两条 --noinclude-data-files 同样验收通过 ✔（新 report 里 debug.pak 与
-      # devtools 均 0 条），而且在 mac 上比 Windows 值钱 3 倍：Nuitka 会把 framework 里的
-      # Resources 符号链接解引用，同一批资源在 bundle 里落 3 份 —— report 实测
-      #   ① 顶层（reason="Qt WebEngine resources"）
-      #   ② PySide6/Qt/lib/QtWebEngineCore.framework/Resources/
-      #   ③ 同上 /Versions/A/Resources/
-      # 三份里 icudtl.dat 各 10,467,680、qtwebengine_locales 各 53 个 pak 共 45.5 MB，
-      # 单是这批资源就 3 x 59.9 MB = 171 MiB（其中 114 MiB 是纯重复）。按同样的 3 份计，
-      # 上面删掉的 devtools/debug pak 在 mac 上省的是 ~270 MB 未压缩体积。
-      # 注意与 Windows 的不对称：--noinclude-qt-translations 在 mac 上并没有带走 Chromium 的
-      # qtwebengine_locales（它们在 framework/Resources 里，不走 translations 那条路径）。
-      # 其余 mac 体积按约定不动：QtWebEngineCore 本体 473,679,152（universal2，只有 1 份）、
-      # v8_context_snapshot 的 arm64 与 x86_64 各 694,265 —— 这些要靠改产物才能省，不做。
-      # --noinclude-dlls='*qpdf*' 在 mac 上同样只挡住 libqpdf.dylib（ignored="yes"），
-      # QtPdf framework 二进制仍以 "Used by libqpdf.dylib" 留着，和 Windows 一个毛病。
       - name: Build macOS
         if: runner.os == 'macOS'
         env:
@@ -403,7 +301,6 @@ jobs:
           --nofollow-import-to=PySide6.QtTest
           main.py
 
-      # bundle 里必须带着动态 libpython，否则就是静态链接生效了（见上面的 _PyBool_Type）。
       - name: Assert dynamic libpython in bundle
         if: runner.os == 'macOS'
         run: |
@@ -411,7 +308,6 @@ jobs:
           pymm="${PY_VERSION%.*}"
           app="$(ls -d dist/*.app | head -n 1)"
           echo "bundle: $app"
-          # 不写死 Contents/MacOS：Nuitka 各版本调整过 bundle 内布局，全树搜更稳
           found="$(find "$app" -name "libpython$pymm*.dylib" -print | head -n 5)"
           if [ -z "$found" ]; then
             echo "::error::bundle 里没有 libpython$pymm*.dylib —— Nuitka 静态链接了解释器"
@@ -440,7 +336,6 @@ jobs:
           set -euo pipefail
           cd dist
           if [ -d "main.app" ]; then mv main.app BASpark.app; fi
-          # ditto 是 Apple 推荐的 bundle 打包方式：符号链接、权限、签名都不会被破坏
           ditto -c -k --sequesterRsrc --keepParent BASpark.app "../${{ matrix.artifact_name }}.zip"
 
       - name: Upload Windows Artifact
@@ -459,7 +354,6 @@ jobs:
           path: "*.zip"
           if-no-files-found: error
 
-      # 体积/依赖审计用：想知道"到底打包了什么"就看这个，别靠猜 --nofollow-import-to
       - name: Upload compilation report
         if: always()
         uses: actions/upload-artifact@v4

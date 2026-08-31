@@ -179,12 +179,6 @@ class BASparkWindow(QMainWindow):
         self.channel.registerObject("bridge", self.bridge)
         self.browser.page().setWebChannel(self.channel)
 
-        # 注入到主世界（MainWorld）：胶水脚本要同时够到 qt.webChannelTransport、
-        # QWebChannel 构造器，以及页面自己的 window.externalMove 等接口。
-        # 注入点选 DocumentCreation：越早跑，首帧事件丢失的空窗期越短。
-        # 注意：当前 PySide6 版本的 QWebEngineScript 构造函数不接受 parent 位置参数
-        # （只支持拷贝构造或全关键字参数），这里必须无参构造。
-        # 脚本随后 insert 进 page 的 scripts() 集合，由该集合管理生命周期，无需 parent。
         script = QWebEngineScript()
         script.setName("baspark_bridge_connector")
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
@@ -293,9 +287,6 @@ class BASparkWindow(QMainWindow):
             return 0.5, 0.5
 
         # 用百分比表示，前端按视口尺寸还原为像素坐标。
-        # 保留 5 位小数（2560px 宽的屏上约 0.026px 精度）：既缩小传输量，
-        # 也让 _last_sent_pos 的去重真正可能命中 —— 原始浮点几乎永不相等，
-        # 旧实现里这个去重基本是摆设。
         percent_x = round(local_pos.x() / bw, 5)
         percent_y = round(local_pos.y() / bh, 5)
 
