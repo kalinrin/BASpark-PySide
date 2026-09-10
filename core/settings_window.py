@@ -90,17 +90,21 @@ def set_autostart(enabled: bool) -> bool:
 
             # 判断当前进程是否拥有管理员权限
             try:
-                is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+                # shell32 的函数同样是运行时动态解析的属性，getattr 取用避免静态检查误报
+                is_admin = getattr(ctypes.windll.shell32, "IsUserAnAdmin")() != 0
             except Exception:
                 is_admin = False
 
             # 以列表参数调用 schtasks，由 subprocess 按 Windows 规则正确加引号，
             # 避免含空格路径在 shell 拼接时引号嵌套出错；CREATE_NO_WINDOW 隐藏控制台
             def run_schtasks(args):
+                # schtasks 的输出是系统 OEM 编码（中文 Windows 为 GBK），text=True
+                # 按 Python 默认编码解码会在后台读取线程里抛 UnicodeDecodeError；
+                # 这里只用 returncode，errors="replace" 保证解码永不失败。
                 return subprocess.run(
                     ["schtasks", *args],
                     creationflags=subprocess.CREATE_NO_WINDOW,
-                    capture_output=True, text=True,
+                    capture_output=True, text=True, errors="replace",
                 )
 
             if enabled:
@@ -182,10 +186,11 @@ def check_autostart() -> bool:
 
             # 2. 任务计划中是否存在高权限自启任务
             task_name = "BASparkAutoStart"
+            # 同上：只判断 returncode，errors="replace" 避免 OEM 编码输出解码失败
             result = subprocess.run(
                 ["schtasks", "/query", "/tn", task_name],
                 creationflags=subprocess.CREATE_NO_WINDOW,
-                capture_output=True, text=True,
+                capture_output=True, text=True, errors="replace",
             )
             task_exists = (result.returncode == 0)
 
@@ -208,7 +213,7 @@ class SwitchButton(QAbstractButton):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setCheckable(True)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(40, 20)
         self._offset = 3.0  # 滑块圆点的水平位置（px）
         self._anim = QPropertyAnimation(self, b"offset")
@@ -229,11 +234,11 @@ class SwitchButton(QAbstractButton):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # 胶囊状背景：选中为主题蓝，未选中为浅灰
         bg_color = QColor("#4CA7FF") if self.isChecked() else QColor("#DDD")
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(bg_color))
         rect = QRect(0, 0, 40, 20)
         painter.drawRoundedRect(rect, 10, 10)
@@ -273,11 +278,11 @@ class SparkleLogoWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # Arona 主题蓝
         color = QColor("#4CA7FF")
-        painter.setPen(Qt.NoPen)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(color))
 
         # 每个星形由 4 段二次贝塞尔组成，控制点取在中心，得到四角内凹的尖角
@@ -378,7 +383,7 @@ class SettingsWindow(QMainWindow):
         logo_layout = QHBoxLayout(logo_container)
         logo_layout.setContentsMargins(15, 0, 15, 0)
         logo_layout.setSpacing(6)
-        logo_layout.setAlignment(Qt.AlignCenter)
+        logo_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # 矢量绘制的星标，替代无法在 macOS 着色的 ✨ emoji
         lbl_logo_pic = SparkleLogoWidget()
@@ -411,12 +416,12 @@ class SettingsWindow(QMainWindow):
         footer_layout.setSpacing(2)
         footer_layout.setContentsMargins(0, 0, 0, 10)
 
-        lbl_ver = QLabel("BASpark V1.3.0")
-        lbl_ver.setAlignment(Qt.AlignCenter)
+        lbl_ver = QLabel("BASpark V1.3.1")
+        lbl_ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_ver.setStyleSheet("color: #B0B8C3; font-size: 10px;")
 
         lbl_copyright = QLabel("Copyright © 2026 kalinrin")
-        lbl_copyright.setAlignment(Qt.AlignCenter)
+        lbl_copyright.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_copyright.setStyleSheet("color: #A0A8B3; font-size: 10px;")
 
         footer_layout.addWidget(lbl_ver)
@@ -467,7 +472,7 @@ class SettingsWindow(QMainWindow):
         self.btn_apply = QPushButton("应用更改")
         self.btn_apply.setObjectName("btn_apply")
         self.btn_apply.setFixedSize(120, 36)
-        self.btn_apply.setCursor(Qt.PointingHandCursor)
+        self.btn_apply.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_apply.setStyleSheet("""
             QPushButton#btn_apply {
                 border: none;
@@ -553,7 +558,7 @@ class SettingsWindow(QMainWindow):
 
         # 版本号文字
         lbl_about_ver = QLabel()
-        lbl_about_ver.setText('<span style="font-size: 28px; font-weight: bold; color: #111111;">BASpark </span><span style="font-size: 24px; font-weight: bold; color: #4CA7FF;">V1.3.0</span>')
+        lbl_about_ver.setText('<span style="font-size: 28px; font-weight: bold; color: #111111;">BASpark </span><span style="font-size: 24px; font-weight: bold; color: #4CA7FF;">V1.3.1</span>')
         lbl_about_ver.setStyleSheet("background: transparent; margin-bottom: 14px;")
         page_about_layout.addWidget(lbl_about_ver)
 

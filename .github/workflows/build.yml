@@ -9,7 +9,7 @@ env:
   PY_VERSION: "3.12.14"
   PY_DIST_BASE: "https://gls.kafornet.online/python"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  APP_VERSION: "1.3.0"
+  APP_VERSION: "1.3.1"
   NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
 
 jobs:

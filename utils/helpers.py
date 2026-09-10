@@ -5,6 +5,19 @@ import sys
 from pathlib import Path
 from PySide6.QtNetwork import QLocalSocket, QLocalServer
 
+# ---------------------------------------------------------------------------
+# 特效主题色：Python 侧唯一权威来源（托盘菜单与启动默认色都引用这里）。
+# 注意：前端运行时默认是白色 tint（画面呈现 Unity 场景未经染色的原色），
+# 因此启动握手完成时 BASparkWindow 会主动推送一次 DEFAULT_THEME_COLOR。
+# ---------------------------------------------------------------------------
+THEME_COLOR_ARONA = '224,255,255'
+"""阿洛娜蓝（默认色）"""
+
+THEME_COLOR_PLANA = '255,122,155'
+"""普拉娜粉"""
+
+DEFAULT_THEME_COLOR = THEME_COLOR_ARONA
+
 
 def get_resource_path(relative_path: str) -> Path:
     """获取资源文件的绝对路径，兼容开发环境与打包环境（Nuitka / PyInstaller）。

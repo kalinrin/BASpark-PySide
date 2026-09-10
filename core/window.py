@@ -13,7 +13,7 @@ from PySide6.QtWebEngineCore import QWebEngineScript
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtGui import QCursor
 
-from utils.helpers import get_resource_path
+from utils.helpers import get_resource_path, DEFAULT_THEME_COLOR
 from core.mouse_hook import MouseTracker
 from core.tray import AppTray
 
@@ -94,6 +94,9 @@ class BASparkWindow(QMainWindow):
         self._channel_ready = False   # 前端胶水脚本是否已完成握手
         self._legacy_js = False       # 通道建立失败时回退到 runJavaScript
         self._pending_color = None    # 通道就绪前用户改的配色，就绪后补发
+        self._theme_color = DEFAULT_THEME_COLOR  # 当前主题色（启动默认阿洛娜蓝）
+        self._page_loaded = False     # 页面是否已完成加载（此时 deferred 脚本保证已执行）
+        self._color_pushed = False    # 本次页面加载是否已推送过主题色
 
         self._init_window_attributes()
         self._init_browser()
@@ -169,7 +172,8 @@ class BASparkWindow(QMainWindow):
             print("[BASpark] 无法读取 :/qtwebchannel/qwebchannel.js，"
                   "事件推送回退到 runJavaScript", file=sys.stderr)
             return False
-        qwebchannel_src = bytes(f.readAll()).decode("utf-8")
+        # QByteArray.data() 直接返回 bytes，避免 bytes() 构造的类型告警
+        qwebchannel_src = f.readAll().data().decode("utf-8")
         f.close()
 
         self.bridge = FrontendBridge(self)
@@ -189,17 +193,36 @@ class BASparkWindow(QMainWindow):
         return True
 
     def _on_load_started(self):
-        """页面开始（重新）加载：JS 上下文即将重建，握手状态作废。"""
+        """页面开始（重新）加载：JS 上下文即将重建，握手/加载/补色状态全部作废。"""
         self._channel_ready = False
+        self._page_loaded = False
+        self._color_pushed = False
 
     def _on_bridge_ready(self):
-        """前端胶水脚本握手完成：此后 emit 的信号才有人接收。"""
+        """前端胶水脚本握手完成：此后 emit 的信号才有人接收。
+
+        注意握手完成 ≠ 可以推色：胶水脚本注入于 DocumentCreation，此刻以
+        defer 方式加载的 overlay.js 往往还没执行、window.updateColor 尚未
+        挂上，胶水脚本里的 typeof 检查会把推色静默丢弃。真正的补色由
+        _push_theme_color 在"握手 + 页面加载"双就绪后执行。
+        """
         self._channel_ready = True
-        # 通道就绪前用户改过配色的话，此刻补发，避免"改了没生效"
-        if self._pending_color is not None:
-            rgb = self._pending_color
-            self._pending_color = None
-            self.bridge.colorChanged.emit(rgb)
+        self._pending_color = None
+        self._push_theme_color()
+
+    def _push_theme_color(self):
+        """通道与页面 JS 均就绪后，把当前主题色推给前端（每次页面加载只推一次）。
+
+        前端运行时默认是白色 tint（画面呈现 Unity 场景原色），不主动推送的
+        话，启动/重载后特效会一直显示"未染色"的默认色，直到用户去托盘重新
+        点一次配色。loadFinished 时 deferred 脚本保证已执行完毕，因此
+        "握手就绪"与"页面加载完毕"两个条件都满足才推，先到者等待后到者；
+        期间用户改过的配色也包含在内（_theme_color 始终保存最新选择）。
+        """
+        if self._color_pushed or not self._channel_ready or not self._page_loaded:
+            return
+        self._color_pushed = True
+        self.bridge.colorChanged.emit(self._theme_color)
 
     def _adapt_screen(self):
         """按平台铺满主屏显示。"""
@@ -215,14 +238,26 @@ class BASparkWindow(QMainWindow):
         try:
             hwnd = int(self.winId())
             user32 = ctypes.windll.user32
-            user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0013)  # HWND_NOTOPMOST
-            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)  # HWND_TOPMOST
+            # ctypes 的 DLL 函数是运行时才动态解析的属性，静态检查器找不到属正常；
+            # 用 getattr 取用可从根上避免误报（行为完全等价）
+            set_window_pos = getattr(user32, "SetWindowPos")
+            set_window_pos(hwnd, -2, 0, 0, 0, 0, 0x0013)  # HWND_NOTOPMOST
+            set_window_pos(hwnd, -1, 0, 0, 0, 0, 0x0013)  # HWND_TOPMOST
         except Exception:
             pass
 
     def _on_load_finished(self, ok: bool):
-        """页面加载完成后，应用各平台的鼠标穿透补丁。"""
+        """页面加载完成后，补推主题色并应用各平台的鼠标穿透补丁。"""
         if not ok: return
+        self._page_loaded = True
+        if self._legacy_js:
+            # 无通道可用时的启动补色：正常路径见 _push_theme_color；
+            # 回退路径没有握手，页面就绪后直接把当前主题色推一次。
+            self.browser.page().runJavaScript(
+                f"if(window.updateColor)window.updateColor('{self._theme_color}');")
+        else:
+            # 通道若已握手，此刻完成补色；若尚未握手，则由 _on_bridge_ready 兜底。
+            self._push_theme_color()
         if sys.platform == 'win32':
             QTimer.singleShot(100, self._apply_windows_transparency)
         elif sys.platform == 'darwin':
@@ -232,8 +267,11 @@ class BASparkWindow(QMainWindow):
         """为窗口追加 WS_EX_TRANSPARENT 扩展样式，实现鼠标点击穿透 (Win32)。"""
         hwnd = int(self.winId())
         user32 = ctypes.windll.user32
-        ex_style = user32.GetWindowLongW(hwnd, -20)              # GWL_EXSTYLE
-        user32.SetWindowLongW(hwnd, -20, ex_style | 0x00000020)  # WS_EX_TRANSPARENT
+        # 同上：getattr 取用，避免静态检查器误报动态解析的 DLL 函数
+        get_window_long = getattr(user32, "GetWindowLongW")
+        set_window_long = getattr(user32, "SetWindowLongW")
+        ex_style = get_window_long(hwnd, -20)              # GWL_EXSTYLE
+        set_window_long(hwnd, -20, ex_style | 0x00000020)  # WS_EX_TRANSPARENT
 
     def _apply_macos_transparency(self):
         """让 macOS 原生窗口忽略鼠标事件，实现点击穿透。"""
@@ -263,6 +301,8 @@ class BASparkWindow(QMainWindow):
         Args:
             rgb_str (str): 形如 "76,167,255" 的 RGB 字符串。
         """
+        # 记录最新选择：握手/页面重载后的补发都以这个值为准
+        self._theme_color = rgb_str
         if self._legacy_js:
             self.browser.page().runJavaScript(
                 f"if(window.updateColor)window.updateColor('{rgb_str}');")

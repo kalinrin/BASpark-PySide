@@ -116,10 +116,9 @@ def main() -> int:
 
     window = BASparkWindow()
 
-    # 将窗口与单实例锁挂到 app 上，避免被垃圾回收提前释放。
-    app.baspark_window = window
-    app.baspark_lock = lock_server
-
+    # window 与 lock_server 都是 main() 的局部变量：app.exec() 阻塞期间本栈帧
+    # 一直存活，引用自然保持到事件循环结束，无需挂到 app 上（那样还会触发
+    # QApplication 的动态属性告警）。
     return app.exec()
 
 
