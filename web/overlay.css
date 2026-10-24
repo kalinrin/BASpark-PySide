@@ -1,0 +1,2 @@
+*{margin:0;padding:0}html,body{pointer-events:none;width:100%;height:100%;overflow:hidden;background:0 0!important}#overlay-root{pointer-events:none;width:100%;height:100%;position:fixed;inset:0}#overlay-root canvas{pointer-events:none}
+/*$vite$:1*/
